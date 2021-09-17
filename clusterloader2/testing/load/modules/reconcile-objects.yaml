@@ -74,7 +74,7 @@ steps:
       action: start
       checkIfPodsAreUpdated: {{$CHECK_IF_PODS_ARE_UPDATED}}
       labelSelector: group = load
-      operationTimeout: 15m
+      operationTimeout: 3h
 
 - name: {{$actionName}}
   phases:
