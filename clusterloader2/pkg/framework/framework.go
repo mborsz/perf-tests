@@ -32,6 +32,7 @@ import (
 	"k8s.io/perf-tests/clusterloader2/pkg/framework/client"
 	frconfig "k8s.io/perf-tests/clusterloader2/pkg/framework/config"
 
+	"k8s.io/client-go/informers"
 	restclient "k8s.io/client-go/rest"
 
 	// ensure auth plugins are loaded
@@ -51,6 +52,7 @@ type Framework struct {
 	dynamicClients        *MultiDynamicClient
 	clusterConfig         *config.ClusterConfig
 	restClientConfig      *restclient.Config
+	informerFactory       informers.SharedInformerFactory
 }
 
 // NewFramework creates new framework based on given clusterConfig.
@@ -81,10 +83,10 @@ func newFramework(clusterConfig *config.ClusterConfig, clientsNumber int, kubeCo
 	if f.dynamicClients, err = NewMultiDynamicClient(kubeConfigPath, clientsNumber); err != nil {
 		return nil, fmt.Errorf("multi dynamic client creation error: %v", err)
 	}
-
 	if f.restClientConfig, err = frconfig.GetConfig(kubeConfigPath); err != nil {
 		return nil, fmt.Errorf("rest client creation error: %v", err)
 	}
+	f.informerFactory = informers.NewSharedInformerFactory(f.clientSets.GetClient(), 0 /* defaultResync */)
 	return &f, nil
 }
 
@@ -115,6 +117,16 @@ func (f *Framework) GetRestClient() *restclient.Config {
 // GetClusterConfig returns cluster config.
 func (f *Framework) GetClusterConfig() *config.ClusterConfig {
 	return f.clusterConfig
+}
+
+// GetInformerFactory returns informer factory.
+func (f *Framework) GetInformerFactory() informers.SharedInformerFactory {
+	return f.informerFactory
+}
+
+// Start starts informers requested in informerFactory.
+func (f *Framework) Start(stopCh <-chan struct{}) {
+	f.informerFactory.Start(stopCh)
 }
 
 // CreateAutomanagedNamespaces creates automanged namespaces.

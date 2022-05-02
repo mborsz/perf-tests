@@ -125,3 +125,9 @@ func (sc *simpleContext) GetTestConfig() *api.Config {
 func (sc *simpleContext) SetTestConfig(c *api.Config) {
 	sc.testConfig = c
 }
+
+// Start starts informers requested in framework instances.
+func (sc *simpleContext) Start(stopCh <-chan struct{}) {
+	sc.clusterFramework.Start(stopCh)
+	sc.prometheusFramework.Start(stopCh)
+}

@@ -51,6 +51,13 @@ type Measurement interface {
 	String() string
 }
 
+// MeasurementWithInit is an interface implemented by some Measurements, that requires Init call before test execution starts.
+// Init is a right place to request required informers.
+type MeasurementWithInit interface {
+	Measurement
+	Init(config *Config) error
+}
+
 type createMeasurementFunc func() Measurement
 
 // Summary represenst result of specific measurement.

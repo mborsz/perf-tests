@@ -24,6 +24,24 @@ import (
 	"k8s.io/perf-tests/clusterloader2/pkg/errors"
 )
 
+// Init initializes a measurement.
+func Init(mm Manager, m *api.Measurement) *errors.ErrorList {
+	errList := errors.NewErrorList()
+	if m.Identifier != "" {
+		if err := mm.Init(m.Method, m.Identifier); err != nil {
+			errList.Append(formatError(m.Method, m.Identifier, err))
+		}
+	}
+	for i := range m.Instances {
+		identifier := m.Instances[i].Identifier
+		if err := mm.Init(m.Method, identifier); err != nil {
+			errList.Append(formatError(m.Method, identifier, err))
+		}
+	}
+
+	return errList
+}
+
 // Execute executes a measurement, which can be a single measurement or a wrapper for multiple measurements.
 func Execute(mm Manager, m *api.Measurement) *errors.ErrorList {
 	if m.Identifier != "" {
@@ -33,7 +51,7 @@ func Execute(mm Manager, m *api.Measurement) *errors.ErrorList {
 }
 
 func formatError(method, identifier string, err error) error {
-	return fmt.Errorf("measurement call %s - %s error: %v", method, identifier, err)
+	return fmt.Errorf("measurement call %s - %s error: %w", method, identifier, err)
 }
 
 func executeSingleMeasurement(mm Manager, m *api.Measurement) *errors.ErrorList {

@@ -39,6 +39,17 @@ func NewInformer(
 	return informer
 }
 
+// NewIndexInformer creates a new indexed informer.
+func NewIndexInformer(
+	lw cache.ListerWatcher,
+	handleObj func(interface{}, interface{}),
+	indexers cache.Indexers,
+) cache.SharedIndexInformer {
+	informer := cache.NewSharedIndexInformer(lw, nil, 0, indexers)
+	addEventHandler(informer, handleObj)
+	return informer
+}
+
 // NewDynamicInformer creates a new dynamic informer
 // for given namespace, fieldSelector and labelSelector.
 func NewDynamicInformer(
@@ -91,4 +102,13 @@ func StartAndSync(i cache.SharedInformer, stopCh <-chan struct{}, timeout time.D
 		return fmt.Errorf("timed out waiting for caches to sync")
 	}
 	return nil
+}
+
+// AddIndexerIfNotPresent adds the index function with the name into the cache indexer if not present
+func AddIndexerIfNotPresent(indexer cache.Indexer, indexName string, indexFunc cache.IndexFunc) error {
+	indexers := indexer.GetIndexers()
+	if _, ok := indexers[indexName]; ok {
+		return nil
+	}
+	return indexer.AddIndexers(cache.Indexers{indexName: indexFunc})
 }

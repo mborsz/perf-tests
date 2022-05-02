@@ -38,6 +38,7 @@ type measurementManager struct {
 
 // Manager provides the interface for measurementManager
 type Manager interface {
+	Init(methodName string, identifier string) error
 	Execute(methodName string, identifier string, params map[string]interface{}) error
 	GetSummaries() []Summary
 	Dispose()
@@ -55,13 +56,37 @@ func CreateManager(clusterFramework, prometheusFramework *framework.Framework, t
 	}
 }
 
-// Execute executes measurement based on provided identifier, methodName and params.
-func (mm *measurementManager) Execute(methodName string, identifier string, params map[string]interface{}) error {
-	measurementInstance, err := mm.getMeasurementInstance(methodName, identifier)
+// Init calls Init method on the measurement (if exists).
+func (mm *measurementManager) Init(methodName string, identifier string) error {
+	m, created, err := mm.getMeasurementInstance(methodName, identifier)
 	if err != nil {
 		return err
 	}
-	config := &Config{
+	if !created {
+		// Already initialized.
+		return nil
+	}
+	if m, ok := m.(MeasurementWithInit); ok {
+		config := mm.configForMeasurement(identifier, nil /* params */)
+		return m.Init(config)
+	}
+	return nil
+}
+
+// Execute executes measurement based on provided identifier, methodName and params.
+func (mm *measurementManager) Execute(methodName string, identifier string, params map[string]interface{}) error {
+	measurementInstance, _, err := mm.getMeasurementInstance(methodName, identifier)
+	if err != nil {
+		return err
+	}
+	config := mm.configForMeasurement(identifier, params)
+	summaries, err := measurementInstance.Execute(config)
+	mm.summaries = append(mm.summaries, summaries...)
+	return err
+}
+
+func (mm *measurementManager) configForMeasurement(identifier string, params map[string]interface{}) *Config {
+	return &Config{
 		ClusterFramework:    mm.clusterFramework,
 		PrometheusFramework: mm.prometheusFramework,
 		Params:              params,
@@ -70,9 +95,6 @@ func (mm *measurementManager) Execute(methodName string, identifier string, para
 		CloudProvider:       mm.clusterLoaderConfig.ClusterConfig.Provider,
 		ClusterLoaderConfig: mm.clusterLoaderConfig,
 	}
-	summaries, err := measurementInstance.Execute(config)
-	mm.summaries = append(mm.summaries, summaries...)
-	return err
 }
 
 // GetSummaries returns collected summaries.
@@ -89,7 +111,7 @@ func (mm *measurementManager) Dispose() {
 	}
 }
 
-func (mm *measurementManager) getMeasurementInstance(methodName string, identifier string) (Measurement, error) {
+func (mm *measurementManager) getMeasurementInstance(methodName string, identifier string) (_ Measurement, created bool, err error) {
 	mm.lock.Lock()
 	defer mm.lock.Unlock()
 	if _, exists := mm.measurements[methodName]; !exists {
@@ -98,9 +120,10 @@ func (mm *measurementManager) getMeasurementInstance(methodName string, identifi
 	if _, exists := mm.measurements[methodName][identifier]; !exists {
 		measurementInstance, err := factory.createMeasurement(methodName)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		mm.measurements[methodName][identifier] = measurementInstance
+		return measurementInstance, true, nil
 	}
-	return mm.measurements[methodName][identifier], nil
+	return mm.measurements[methodName][identifier], false, nil
 }

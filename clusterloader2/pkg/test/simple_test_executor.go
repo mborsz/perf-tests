@@ -72,7 +72,11 @@ func (ste *simpleExecutor) ExecuteTest(ctx Context, conf *api.Config) *errors.Er
 	if err := ste.prepareTestNamespaces(ctx, conf); err != nil {
 		return errors.NewErrorList(fmt.Errorf("error while preparing test namespaces: %w", err))
 	}
-	errList := ste.ExecuteTestSteps(ctx, conf.Steps)
+
+	errList := ste.InitMeasurements(ctx, conf.Steps)
+	ctx.Start(stopCh)
+
+	errList.Concat(ste.ExecuteTestSteps(ctx, conf.Steps))
 	close(stopCh)
 
 	if chaosMonkeyWaitGroup != nil {
@@ -123,6 +127,22 @@ func (ste *simpleExecutor) prepareTestNamespaces(ctx Context, conf *api.Config) 
 		return fmt.Errorf("automanaged namespaces creation failed: %w", err)
 	}
 	return nil
+}
+
+// InitMeasurements initializes all measurement instances that are referenced in steps.
+func (ste *simpleExecutor) InitMeasurements(ctx Context, steps []*api.Step) *errors.ErrorList {
+	stepResults := NewStepResult("[step: 00] InitMeasurements")
+	for _, step := range steps {
+		for _, m := range step.Measurements {
+			stepResults.AddStepError(measurement.Init(ctx.GetManager(), m))
+		}
+	}
+	allErrors := stepResults.GetAllErrors()
+	if !allErrors.IsEmpty() {
+		klog.Warningf("Got errors during step execution: %v", allErrors)
+	}
+	ctx.GetTestReporter().ReportTestStep(stepResults)
+	return allErrors
 }
 
 // ExecuteTestSteps executes all test steps provided in configuration

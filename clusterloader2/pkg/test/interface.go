@@ -61,6 +61,7 @@ type Context interface {
 	GetTestScenario() *api.TestScenario
 	GetTestConfig() *api.Config
 	SetTestConfig(*api.Config)
+	Start(stopCh <-chan struct{})
 }
 
 // Executor is an interface for test executing object.
@@ -78,6 +79,6 @@ type Reporter interface {
 	BeginTestSuite()
 	EndTestSuite()
 	ReportTestStepFinish(duration time.Duration, stepName string, errList *errors.ErrorList)
-	ReportTestStep(result StepResult)
+	ReportTestStep(result *StepResult)
 	ReportTestFinish(duration time.Duration, testConfigPath string, errList *errors.ErrorList)
 }
