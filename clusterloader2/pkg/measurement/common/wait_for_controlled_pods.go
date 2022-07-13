@@ -107,6 +107,7 @@ type waitForControlledPodsRunningMeasurement struct {
 }
 
 func (w *waitForControlledPodsRunningMeasurement) Init(c *measurement.Config) error {
+	klog.Infof("Called Init on %v/%v", waitForControlledPodsRunningName, c.Identifier)
 	podInformer := c.ClusterFramework.GetInformerFactory().Core().V1().Pods().Informer()
 	informer.AddIndexerIfNotPresent(podInformer.GetIndexer(), cache.NamespaceIndex, cache.MetaNamespaceIndexFunc)
 
