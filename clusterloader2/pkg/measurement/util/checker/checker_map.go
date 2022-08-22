@@ -29,11 +29,16 @@ func NewMap() Map {
 	return make(map[string]Checker)
 }
 
-// Dispose stops all checkers and cleans up the map.
-func (cm Map) Dispose() {
+// StopAll stops all checkers.
+func (cm Map) StopAll() {
 	for _, c := range cm {
 		c.Stop()
 	}
+}
+
+// Dispose stops all checkers and cleans up the map.
+func (cm Map) Dispose() {
+	cm.StopAll()
 	cm = make(map[string]Checker)
 }
 

@@ -111,10 +111,10 @@ func createWaitForControlledPodsRunningMeasurement() measurement.Measurement {
 }
 
 type waitForControlledPodsRunningMeasurement struct {
-	apiVersion       string
-	kind             string
-	selector         *measurementutil.ObjectSelector
-	operationTimeout time.Duration
+	apiVersion            string
+	kind                  string
+	selector              *measurementutil.ObjectSelector
+	startOperationTimeout time.Duration
 	// countErrorMargin orders measurement to wait for number of pods to be in
 	// <desired count - countErrorMargin, desired count> range
 	// When using preemptibles on large scale, number of ready nodes is not stable
@@ -162,7 +162,7 @@ func (w *waitForControlledPodsRunningMeasurement) Execute(config *measurement.Co
 		if err = w.selector.Parse(config.Params); err != nil {
 			return nil, err
 		}
-		w.operationTimeout, err = util.GetDurationOrDefault(config.Params, "operationTimeout", defaultOperationTimeout)
+		w.startOperationTimeout, err = util.GetDurationOrDefault(config.Params, "operationTimeout", defaultOperationTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -180,7 +180,11 @@ func (w *waitForControlledPodsRunningMeasurement) Execute(config *measurement.Co
 		if err != nil {
 			return nil, err
 		}
-		return nil, w.gather(syncTimeout)
+		operationTimeout, err := util.GetDurationOrDefault(config.Params, "operationTimeout", time.Duration(0))
+		if err != nil {
+			return nil, err
+		}
+		return nil, w.gather(syncTimeout, operationTimeout)
 	case "stop":
 		w.Dispose()
 		return nil, nil
@@ -242,7 +246,7 @@ func (w *waitForControlledPodsRunningMeasurement) start() error {
 	return informer.StartAndSync(i, w.stopCh, informerSyncTimeout)
 }
 
-func (w *waitForControlledPodsRunningMeasurement) gather(syncTimeout time.Duration) error {
+func (w *waitForControlledPodsRunningMeasurement) gather(syncTimeout, operationTimeout time.Duration) error {
 	klog.V(2).Infof("%v: waiting for controlled pods measurement...", w)
 	if !w.isRunning {
 		return fmt.Errorf("metric %s has not been started", w)
@@ -275,6 +279,34 @@ func (w *waitForControlledPodsRunningMeasurement) gather(syncTimeout time.Durati
 	}
 	if err := wait.Poll(checkControlledPodsInterval, syncTimeout, cond); err != nil {
 		return fmt.Errorf("timed out while waiting for controlled pods: %v", err)
+	}
+
+	if operationTimeout != time.Duration(0) {
+		// If requested, wait at most `waitTimeout` and then force handlers to stop.
+		klog.Infof("Waiting at most %v for all handlers to finish", operationTimeout)
+		var lastUnknownObjects []string
+		cond := func() (bool, error) {
+			w.lock.Lock()
+			defer w.lock.Unlock()
+
+			var unknownObjects []string
+			for _, checker := range w.checkerMap {
+				objChecker := checker.(*objectChecker)
+				status, _ := objChecker.getStatus()
+				if status == unknown {
+					unknownObjects = append(unknownObjects, objChecker.key)
+				}
+			}
+			klog.Infof("Still waiting for %d objects.", len(unknownObjects))
+			lastUnknownObjects = unknownObjects
+			return len(unknownObjects) == 0, nil
+		}
+		if err := wait.Poll(checkControlledPodsInterval, operationTimeout, cond); err != nil {
+			klog.Errorf("Timed out waiting for handlers to finish: %v. Still running %d objects: %v. Forcing them to stop.", err, len(lastUnknownObjects), strings.Join(lastUnknownObjects, ","))
+			w.lock.Lock()
+			w.checkerMap.StopAll()
+			w.lock.Unlock()
+		}
 	}
 
 	w.handlingGroup.Wait()
@@ -437,7 +469,7 @@ func (w *waitForControlledPodsRunningMeasurement) handleObjectLocked(oldObj, new
 		return fmt.Errorf("meta key creation error: %v", err)
 	}
 
-	operationTimeout := w.operationTimeout
+	operationTimeout := w.startOperationTimeout
 	if isObjDeleted || isScalingDown {
 		// In case of deleting pods, twice as much time is required.
 		// The pod deletion throughput equals half of the pod creation throughput.
@@ -575,6 +607,7 @@ func (w *waitForControlledPodsRunningMeasurement) waitForRuntimeObject(obj runti
 	o := newObjectChecker(key)
 	o.lock.Lock()
 	defer o.lock.Unlock()
+
 	w.handlingGroup.Start(func() {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
