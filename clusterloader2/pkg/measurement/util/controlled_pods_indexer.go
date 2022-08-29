@@ -192,8 +192,10 @@ func getObjUID(obj interface{}) types.UID {
 }
 
 func (p *ControlledPodsIndexer) clearRSDataIfPossibleLocked(rsUID types.UID) error {
+	klog.Infof("clearRSDataIfPossibleLocked for %v", rsUID)
 	state := p.rsUIDToState[rsUID]
 	if state != nil && !state.Exists && state.NumPods == 0 {
+		klog.Infof("Decision to delete %v", rsUID)
 		delete(p.rsUIDToState, rsUID)
 
 		obj, exists, err := p.rsIndexer.GetByKey(string(rsUID))
@@ -273,12 +275,15 @@ func (p *ControlledPodsIndexer) PodsControlledBy(obj interface{}) ([]*corev1.Pod
 		podOwners = append(podOwners, metaAccessor.GetUID())
 	}
 
+	klog.Infof("PodsControlledBy(%v) are using podOwners: %v", metaAccessor.GetUID(), podOwners)
+
 	var res []*corev1.Pod
 	for _, podOwner := range podOwners {
 		res, err = p.appendPodsControlledBy(res, podOwner)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get pods controlled by %v: %w", podOwner, err)
 		}
+		klog.Infof("After append for %v we have size: %d", podOwner, len(res))
 	}
 
 	return res, nil
