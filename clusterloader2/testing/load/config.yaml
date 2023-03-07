@@ -57,7 +57,7 @@
 
 # BEGIN scheduler-throughput section
 # TODO( https://github.com/kubernetes/perf-tests/issues/1027): Lower the number of "min-pods" once we fix the scheduler throughput measurement.
-{{$totalSchedulerThroughputPods := MaxInt (MultiplyInt 2 $MIN_PODS_IN_SMALL_CLUSTERS) .Nodes}}
+{{$totalSchedulerThroughputPods := 15000}}
 # Determines number of pods per deployment. Should be a divider of $totalSchedulerThroughputPods.
 {{$schedulerThroughputPodsPerDeployment := DefaultParam .CL2_SCHEDULER_THROUGHPUT_PODS_PER_DEPLOYMENT $totalSchedulerThroughputPods}}
 {{$schedulerThroughputNamespaces := DivideInt $totalSchedulerThroughputPods $schedulerThroughputPodsPerDeployment}}
@@ -188,6 +188,12 @@ steps:
 
 {{if not $IS_SMALL_CLUSTER}}
 # BEGIN scheduler throughput
+- name: Sleep
+  measurements:
+  - Identifier: WaitBeforeSchedulerThroughput
+    Method: Sleep
+    Params:
+      duration: 5m
 - module:
     path: modules/scheduler-throughput.yaml
     params:

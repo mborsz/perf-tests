@@ -138,7 +138,7 @@ func (s *schedulingThroughputMeasurement) start(clientSet clientset.Interface, s
 				throughput := float64(podsStatus.Scheduled-lastScheduledCount) / float64(measurmentInterval/time.Second)
 				s.schedulingThroughputs = append(s.schedulingThroughputs, throughput)
 				lastScheduledCount = podsStatus.Scheduled
-				klog.V(3).Infof("%v: %s: %d pods scheduled", s, selector.String(), lastScheduledCount)
+				klog.V(0).Infof("%v: %s: %d pods scheduled, throughput=%v", s, selector.String(), lastScheduledCount, throughput)
 			}
 		}
 	}()
