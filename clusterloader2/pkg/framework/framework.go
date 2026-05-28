@@ -33,6 +33,8 @@ import (
 	frconfig "k8s.io/perf-tests/clusterloader2/pkg/framework/config"
 
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 
 	// ensure auth plugins are loaded
@@ -93,6 +95,20 @@ func newFramework(clusterConfig *config.ClusterConfig, clientsNumber int, kubeCo
 	}
 
 	return &f, nil
+}
+
+// NewFakeFramework creates a fake framework for unit testing.
+func NewFakeFramework(client clientset.Interface, dynamicClient dynamic.Interface, clusterConfig *config.ClusterConfig) *Framework {
+	return &Framework{
+		automanagedNamespaces: map[string]bool{},
+		clientSets: &MultiClientSet{
+			clients: []clientset.Interface{client},
+		},
+		dynamicClients: &MultiDynamicClient{
+			clients: []dynamic.Interface{dynamicClient},
+		},
+		clusterConfig: clusterConfig,
+	}
 }
 
 // GetAutomanagedNamespacePrefix returns automanaged namespace prefix.
