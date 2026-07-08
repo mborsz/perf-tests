@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/common/model"
@@ -58,9 +60,43 @@ type testSeries struct {
 }
 
 func (t *testSeries) seriesLoadingString() string {
-	result := fmt.Sprintf("load %v\n", t.Interval)
+	interval, err := time.ParseDuration(t.Interval)
+	if err != nil {
+		// fallback to original if parsing fails
+		result := fmt.Sprintf("load %v\n", t.Interval)
+		for _, is := range t.InputSeries {
+			result += fmt.Sprintf("  %v %v\n", is.Series, is.Values)
+		}
+		return result
+	}
+
+	// Halve the interval
+	newInterval := interval / 2
+	result := fmt.Sprintf("load %v\n", newInterval)
+
 	for _, is := range t.InputSeries {
-		result += fmt.Sprintf("  %v %v\n", is.Series, is.Values)
+		fields := strings.Fields(is.Values)
+		if len(fields) == 0 {
+			result += fmt.Sprintf("  %v %v\n", is.Series, is.Values)
+			continue
+		}
+
+		newValues := make([]string, 0, len(fields)*2-1)
+		for i := 0; i < len(fields); i++ {
+			newValues = append(newValues, fields[i])
+			if i < len(fields)-1 {
+				v1, err1 := strconv.ParseFloat(fields[i], 64)
+				v2, err2 := strconv.ParseFloat(fields[i+1], 64)
+				if err1 == nil && err2 == nil {
+					interpolated := v1 + (v2-v1)/2.0
+					newValues = append(newValues, strconv.FormatFloat(interpolated, 'f', -1, 64))
+				} else {
+					// if not parseable, just repeat the current value
+					newValues = append(newValues, fields[i])
+				}
+			}
+		}
+		result += fmt.Sprintf("  %v %s\n", is.Series, strings.Join(newValues, " "))
 	}
 	return result
 }
