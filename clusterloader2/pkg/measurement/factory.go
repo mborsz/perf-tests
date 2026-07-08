@@ -19,6 +19,11 @@ package measurement
 import (
 	"fmt"
 	"sync"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/cache"
+
+	"k8s.io/perf-tests/clusterloader2/api"
 )
 
 // Factory is a default global factory instance.
@@ -26,14 +31,16 @@ var factory = newMeasurementFactory()
 
 func newMeasurementFactory() *measurementFactory {
 	return &measurementFactory{
-		createFuncs: make(map[string]createMeasurementFunc),
+		createFuncs:        make(map[string]createMeasurementFunc),
+		registeredIndexers: make(map[schema.GroupVersionResource]cache.Indexers),
 	}
 }
 
 // measurementFactory is a factory that creates measurement instances.
 type measurementFactory struct {
-	lock        sync.RWMutex
-	createFuncs map[string]createMeasurementFunc
+	lock               sync.RWMutex
+	createFuncs        map[string]createMeasurementFunc
+	registeredIndexers map[schema.GroupVersionResource]cache.Indexers
 }
 
 func (mc *measurementFactory) register(methodName string, createFunc createMeasurementFunc) error {
@@ -44,6 +51,7 @@ func (mc *measurementFactory) register(methodName string, createFunc createMeasu
 		return fmt.Errorf("measurement with method %v already exists", methodName)
 	}
 	mc.createFuncs[methodName] = createFunc
+	api.RegisteredMeasurements[methodName] = true
 	return nil
 }
 
@@ -65,4 +73,34 @@ func Register(methodName string, createFunc createMeasurementFunc) error {
 // CreateMeasurement creates measurement instance.
 func CreateMeasurement(methodName string) (Measurement, error) {
 	return factory.createMeasurement(methodName)
+}
+
+
+// RegisterIndexer registers indexers for the given resource globally.
+func RegisterIndexer(gvr schema.GroupVersionResource, indexers cache.Indexers) {
+	factory.lock.Lock()
+	defer factory.lock.Unlock()
+
+	if factory.registeredIndexers[gvr] == nil {
+		factory.registeredIndexers[gvr] = make(cache.Indexers)
+	}
+
+	for key, idxFunc := range indexers {
+		factory.registeredIndexers[gvr][key] = idxFunc
+	}
+}
+
+// GetRegisteredIndexers returns all registered indexers.
+func GetRegisteredIndexers() map[schema.GroupVersionResource]cache.Indexers {
+	factory.lock.RLock()
+	defer factory.lock.RUnlock()
+
+	result := make(map[schema.GroupVersionResource]cache.Indexers)
+	for gvr, indexers := range factory.registeredIndexers {
+		result[gvr] = make(cache.Indexers)
+		for k, v := range indexers {
+			result[gvr][k] = v
+		}
+	}
+	return result
 }

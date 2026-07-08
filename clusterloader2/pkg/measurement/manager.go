@@ -17,67 +17,116 @@ limitations under the License.
 package measurement
 
 import (
+	"fmt"
 	"sync"
 
-	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/perf-tests/clusterloader2/pkg/config"
+	"k8s.io/perf-tests/clusterloader2/pkg/framework"
+	"k8s.io/perf-tests/clusterloader2/pkg/measurement/util/informer"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 )
 
-// MeasurementManager manages all measurement executions.
-type MeasurementManager struct {
-	clientSet        clientset.Interface
-	clusterConfig    *config.ClusterConfig
-	templateProvider *config.TemplateProvider
+// measurementManager manages all measurement executions.
+type measurementManager struct {
+	clusterFramework    *framework.Framework
+	clusterLoaderConfig *config.ClusterLoaderConfig
+	prometheusFramework *framework.Framework
+	templateProvider    *config.TemplateProvider
 
 	lock sync.Mutex
 	// map from method type and identifier to measurement instance.
 	measurements map[string]map[string]Measurement
 	summaries    []Summary
+	informerFactory        informers.SharedInformerFactory
+	dynamicInformerFactory dynamicinformer.DynamicSharedInformerFactory
+	informerStopCh         chan struct{}
 }
 
-// CreateMeasurementManager creates new instance of MeasurementManager.
-func CreateMeasurementManager(clientSet clientset.Interface, clusterConfig *config.ClusterConfig, templateProvider *config.TemplateProvider) *MeasurementManager {
-	return &MeasurementManager{
-		clientSet:        clientSet,
-		clusterConfig:    clusterConfig,
-		templateProvider: templateProvider,
-		measurements:     make(map[string]map[string]Measurement),
-		summaries:        make([]Summary, 0),
+// Manager provides the interface for measurementManager
+type Manager interface {
+	Execute(methodName string, identifier string, params map[string]interface{}) error
+	GetSummaries() []Summary
+	Dispose()
+}
+
+// CreateManager creates new instance of measurementManager.
+func CreateManager(clusterFramework, prometheusFramework *framework.Framework, templateProvider *config.TemplateProvider, config *config.ClusterLoaderConfig) Manager {
+	return &measurementManager{
+		clusterFramework:    clusterFramework,
+		clusterLoaderConfig: config,
+		prometheusFramework: prometheusFramework,
+		templateProvider:    templateProvider,
+		measurements:        make(map[string]map[string]Measurement),
+		summaries:           make([]Summary, 0),
 	}
+
+	mm.informerFactory = informers.NewSharedInformerFactoryWithOptions(clusterFramework.GetClientSets().GetClient(), 0, informers.WithTransform(informer.TrimManagedFields))
+	mm.dynamicInformerFactory = dynamicinformer.NewFilteredDynamicSharedInformerFactory(clusterFramework.GetDynamicClients().GetClient(), 0, metav1.NamespaceAll, nil)
+	mm.informerStopCh = make(chan struct{})
+	
+	// Initialize known indexers
+	for gvr, indexers := range factory.registeredIndexers {
+		inf, err := mm.informerFactory.ForResource(gvr)
+		if err != nil {
+			klog.Warningf("Could not instantiate eager informer for %v: %v", gvr, err)
+			continue
+		}
+		if err := inf.Informer().AddIndexers(indexers); err != nil {
+			klog.Warningf("Failed to add indexers for %v: %v", gvr, err)
+		}
+	}
+	return mm
 }
 
 // Execute executes measurement based on provided identifier, methodName and params.
-func (mm *MeasurementManager) Execute(methodName string, identifier string, params map[string]interface{}) error {
+func (mm *measurementManager) Execute(methodName string, identifier string, params map[string]interface{}) error {
 	measurementInstance, err := mm.getMeasurementInstance(methodName, identifier)
 	if err != nil {
 		return err
 	}
-	config := &MeasurementConfig{
-		ClientSet:        mm.clientSet,
-		ClusterConfig:    mm.clusterConfig,
-		Params:           params,
-		TemplateProvider: mm.templateProvider,
+	config := &Config{
+		ClusterFramework:    mm.clusterFramework,
+		PrometheusFramework: mm.prometheusFramework,
+		Params:              params,
+		TemplateProvider:    mm.templateProvider,
+		Identifier:          identifier,
+		CloudProvider:       mm.clusterLoaderConfig.ClusterConfig.Provider,
+		ClusterLoaderConfig: mm.clusterLoaderConfig,
+		InformerFactory:         mm.informerFactory,
+		DynamicInformerFactory:  mm.dynamicInformerFactory,
+		InformerStopCh:          mm.informerStopCh,
 	}
+
+	clusterVersion, err := mm.clusterFramework.GetDiscoveryClient().ServerVersion()
+	if err != nil {
+		return fmt.Errorf("failed to get cluster version")
+	}
+	config.ClusterVersion = *clusterVersion
+
 	summaries, err := measurementInstance.Execute(config)
 	mm.summaries = append(mm.summaries, summaries...)
 	return err
 }
 
 // GetSummaries returns collected summaries.
-func (mm *MeasurementManager) GetSummaries() []Summary {
+func (mm *measurementManager) GetSummaries() []Summary {
 	return mm.summaries
 }
 
 // Dispose disposes measurement instances.
-func (mm *MeasurementManager) Dispose() {
+func (mm *measurementManager) Dispose() {
 	for _, instances := range mm.measurements {
 		for _, measurement := range instances {
 			measurement.Dispose()
 		}
 	}
+	close(mm.informerStopCh)
 }
 
-func (mm *MeasurementManager) getMeasurementInstance(methodName string, identifier string) (Measurement, error) {
+func (mm *measurementManager) getMeasurementInstance(methodName string, identifier string) (Measurement, error) {
 	mm.lock.Lock()
 	defer mm.lock.Unlock()
 	if _, exists := mm.measurements[methodName]; !exists {

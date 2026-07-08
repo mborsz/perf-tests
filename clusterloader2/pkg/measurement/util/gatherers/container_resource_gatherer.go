@@ -17,18 +17,21 @@ limitations under the License.
 package gatherers
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/util/system"
+	"k8s.io/klog/v2"
 	"k8s.io/perf-tests/clusterloader2/pkg/measurement/util"
+	"k8s.io/perf-tests/clusterloader2/pkg/provider"
+	pkgutil "k8s.io/perf-tests/clusterloader2/pkg/util"
 )
 
 // NodesSet is a flag defining the node set range.
@@ -37,10 +40,8 @@ type NodesSet int
 const (
 	// AllNodes - all containers on all nodes
 	AllNodes NodesSet = 0
-	// MasterNodes - all containers on Master nodes only
-	MasterNodes NodesSet = 1
-	// MasterAndDNSNodes - all containers on Master nodes and DNS containers on other nodes
-	MasterAndDNSNodes NodesSet = 2
+	// MasterAndNonDaemons - all containers on Master nodes and non-daemons on other nodes.
+	MasterAndNonDaemons NodesSet = 1
 )
 
 // ResourceUsageSummary represents summary of resource usage per container.
@@ -64,15 +65,23 @@ type ContainerResourceGatherer struct {
 
 // ResourceGathererOptions specifies options for ContainerResourceGatherer.
 type ResourceGathererOptions struct {
-	InKubemark                  bool
-	Nodes                       NodesSet
-	ResourceDataGatheringPeriod time.Duration
-	ProbeDuration               time.Duration
-	PrintVerboseLogs            bool
+	InKubemark                        bool
+	Nodes                             NodesSet
+	ResourceDataGatheringPeriod       time.Duration
+	MasterResourceDataGatheringPeriod time.Duration
+}
+
+func isDaemonPod(pod *corev1.Pod) bool {
+	controller := metav1.GetControllerOf(pod)
+	if controller == nil {
+		// If controller is unset, assume it's not a daemon pod.
+		return false
+	}
+	return controller.Kind == "DaemonSet" || controller.Kind == "Node"
 }
 
 // NewResourceUsageGatherer creates new instance of ContainerResourceGatherer
-func NewResourceUsageGatherer(c clientset.Interface, host, provider string, options ResourceGathererOptions, pods *corev1.PodList) (*ContainerResourceGatherer, error) {
+func NewResourceUsageGatherer(c clientset.Interface, host string, port int, provider provider.Provider, options ResourceGathererOptions, namespace string) (*ContainerResourceGatherer, error) {
 	g := ContainerResourceGatherer{
 		client:       c,
 		isRunning:    true,
@@ -89,26 +98,32 @@ func NewResourceUsageGatherer(c clientset.Interface, host, provider string, opti
 			wg:                          &g.workerWg,
 			finished:                    false,
 			resourceDataGatheringPeriod: options.ResourceDataGatheringPeriod,
-			probeDuration:               options.ProbeDuration,
-			printVerboseLogs:            options.PrintVerboseLogs,
 			host:                        host,
+			port:                        port,
 			provider:                    provider,
 		})
 	} else {
-		// Tracks kube-system pods if no valid PodList is passed in.
-		var err error
-		if pods == nil {
-			pods, err = c.CoreV1().Pods("kube-system").List(metav1.ListOptions{})
-			if err != nil {
-				return nil, fmt.Errorf("listing pods error: %v", err)
+		listOptions := metav1.ListOptions{ResourceVersion: "0"}
+		pods, err := c.CoreV1().Pods(namespace).List(context.TODO(), listOptions)
+		if err != nil {
+			return nil, fmt.Errorf("listing pods error: %v", err)
+		}
+
+		nodeList, err := c.CoreV1().Nodes().List(context.TODO(), listOptions)
+		if err != nil {
+			return nil, fmt.Errorf("listing nodes error: %v", err)
+		}
+
+		masterNodes := sets.NewString()
+		for _, node := range nodeList.Items {
+			if pkgutil.IsControlPlaneNode(&node) {
+				masterNodes.Insert(node.Name)
 			}
 		}
-		dnsNodes := make(map[string]bool)
+
+		nodesToConsider := make(map[string]bool)
 		for _, pod := range pods.Items {
-			if (options.Nodes == MasterNodes) && !system.IsMasterNode(pod.Spec.NodeName) {
-				continue
-			}
-			if (options.Nodes == MasterAndDNSNodes) && !system.IsMasterNode(pod.Spec.NodeName) && pod.Labels["k8s-app"] != "kube-dns" {
+			if (options.Nodes == MasterAndNonDaemons) && !masterNodes.Has(pod.Spec.NodeName) && isDaemonPod(&pod) {
 				continue
 			}
 			for _, container := range pod.Status.InitContainerStatuses {
@@ -117,18 +132,18 @@ func NewResourceUsageGatherer(c clientset.Interface, host, provider string, opti
 			for _, container := range pod.Status.ContainerStatuses {
 				g.containerIDs = append(g.containerIDs, container.Name)
 			}
-			if options.Nodes == MasterAndDNSNodes {
-				dnsNodes[pod.Spec.NodeName] = true
+			if options.Nodes == MasterAndNonDaemons {
+				nodesToConsider[pod.Spec.NodeName] = true
 			}
-		}
-		nodeList, err := c.CoreV1().Nodes().List(metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("listing nodes error: %v", err)
 		}
 
 		for _, node := range nodeList.Items {
-			if options.Nodes == AllNodes || system.IsMasterNode(node.Name) || dnsNodes[node.Name] {
+			if options.Nodes == AllNodes || masterNodes.Has(node.Name) || nodesToConsider[node.Name] {
 				g.workerWg.Add(1)
+				resourceDataGatheringPeriod := options.ResourceDataGatheringPeriod
+				if masterNodes.Has(node.Name) {
+					resourceDataGatheringPeriod = options.MasterResourceDataGatheringPeriod
+				}
 				g.workers = append(g.workers, resourceGatherWorker{
 					c:                           c,
 					nodeName:                    node.Name,
@@ -137,13 +152,9 @@ func NewResourceUsageGatherer(c clientset.Interface, host, provider string, opti
 					stopCh:                      g.stopCh,
 					finished:                    false,
 					inKubemark:                  false,
-					resourceDataGatheringPeriod: options.ResourceDataGatheringPeriod,
-					probeDuration:               options.ProbeDuration,
-					printVerboseLogs:            options.PrintVerboseLogs,
+					resourceDataGatheringPeriod: resourceDataGatheringPeriod,
+					port:                        port,
 				})
-				if options.Nodes == MasterNodes {
-					break
-				}
 			}
 		}
 	}
@@ -169,7 +180,7 @@ func (g *ContainerResourceGatherer) StartGatheringData() {
 // generates resource summary for the passed-in percentiles, and returns the summary.
 func (g *ContainerResourceGatherer) StopAndSummarize(percentiles []int) (*ResourceUsageSummary, error) {
 	g.stop()
-	glog.Infof("Closed stop channel. Waiting for %v workers", len(g.workers))
+	klog.V(2).Infof("Closed stop channel. Waiting for %v workers", len(g.workers))
 	finished := make(chan struct{})
 	go func() {
 		g.workerWg.Wait()
@@ -177,7 +188,7 @@ func (g *ContainerResourceGatherer) StopAndSummarize(percentiles []int) (*Resour
 	}()
 	select {
 	case <-finished:
-		glog.Infof("Waitgroup finished.")
+		klog.V(2).Infof("Waitgroup finished.")
 	case <-time.After(2 * time.Minute):
 		unfinished := make([]string, 0)
 		for i := range g.workers {
@@ -185,11 +196,11 @@ func (g *ContainerResourceGatherer) StopAndSummarize(percentiles []int) (*Resour
 				unfinished = append(unfinished, g.workers[i].nodeName)
 			}
 		}
-		glog.Infof("Timed out while waiting for waitgroup, some workers failed to finish: %v", unfinished)
+		klog.V(1).Infof("Timed out while waiting for waitgroup, some workers failed to finish: %v", unfinished)
 	}
 
 	if len(percentiles) == 0 {
-		glog.Infof("Warning! Empty percentile list for stopAndPrintData.")
+		klog.Warningf("Empty percentile list for stopAndPrintData.")
 		return &ResourceUsageSummary{}, fmt.Errorf("failed to get any resource usage data")
 	}
 	data := make(map[int]util.ResourceUsagePerContainer)
@@ -212,7 +223,7 @@ func (g *ContainerResourceGatherer) StopAndSummarize(percentiles []int) (*Resour
 			usage := data[perc][name]
 			summary[strconv.Itoa(perc)] = append(summary[strconv.Itoa(perc)], util.SingleContainerSummary{
 				Name: name,
-				Cpu:  usage.CPUUsageInCores,
+				CPU:  usage.CPUUsageInCores,
 				Mem:  usage.MemoryWorkingSetInBytes,
 			})
 		}

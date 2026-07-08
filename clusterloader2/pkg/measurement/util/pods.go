@@ -27,28 +27,83 @@ const (
 	nonExist = "NonExist"
 )
 
+type Status int
+
+const (
+	Unknown Status = iota
+	Terminating
+	RunningAndReady
+	RunningButNotReady
+	PendingScheduled
+	PendingNotScheduled
+	Inactive
+)
+
+var _statusName = [...]string{"Unknown", "Terminating", "RunningAndReady",
+	"RunningButNotReady", "PendingScheduled", "PendingNotScheduled", "Inactive"}
+
+func (i Status) String() string {
+	if int(i) >= len(_statusName) {
+		return "Unknown"
+	}
+	return _statusName[i]
+}
+
 // PodsStartupStatus represents status of a pods group.
 type PodsStartupStatus struct {
-	Expected           int
-	Terminating        int
-	Running            int
-	Scheduled          int
-	RunningButNotReady int
-	Waiting            int
-	Pending            int
-	Unknown            int
-	Inactive           int
-	Created            int
+	Expected              int
+	Terminating           int
+	Running               int
+	Scheduled             int
+	RunningButNotReady    int
+	Waiting               int
+	Pending               int
+	Unknown               int
+	Inactive              int
+	Created               int
+	RunningUpdated        int
+	LastIsPodUpdatedError error
 }
 
 // String returns string representation for podsStartupStatus.
 func (s *PodsStartupStatus) String() string {
-	return fmt.Sprintf("Pods: %d out of %d created, %d running, %d pending scheduled, %d not scheduled, %d inactive, %d terminating, %d unknown, %d runningButNotReady ",
-		s.Created, s.Expected, s.Running, s.Pending, s.Waiting, s.Inactive, s.Terminating, s.Unknown, s.RunningButNotReady)
+	return fmt.Sprintf("Pods: %d out of %d created, %d running (%d updated), %d pending scheduled, %d not scheduled, %d inactive, %d terminating, %d unknown, %d runningButNotReady ",
+		s.Created, s.Expected, s.Running, s.RunningUpdated, s.Pending, s.Waiting, s.Inactive, s.Terminating, s.Unknown, s.RunningButNotReady)
+}
+
+func podStatus(p *corev1.Pod) Status {
+	if p.DeletionTimestamp != nil {
+		return Terminating
+	}
+	if p.Status.Phase == corev1.PodRunning {
+		ready := false
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if ready {
+			// Only count a pod is running when it is also ready.
+			return RunningAndReady
+		}
+		return RunningButNotReady
+	}
+	if p.Status.Phase == corev1.PodPending {
+		if p.Spec.NodeName == "" {
+			return PendingNotScheduled
+		}
+		return PendingScheduled
+	}
+	if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+		return Inactive
+	}
+	return Unknown
 }
 
 // ComputePodsStartupStatus computes PodsStartupStatus for a group of pods.
-func ComputePodsStartupStatus(pods []*corev1.Pod, expected int) PodsStartupStatus {
+// TODO(mborsz): Migrate to podStatus instead of recalculating per pod status here.
+func ComputePodsStartupStatus(pods []*corev1.Pod, expected int, isPodUpdated func(*corev1.Pod) error) PodsStartupStatus {
 	startupStatus := PodsStartupStatus{
 		Expected: expected,
 	}
@@ -69,6 +124,15 @@ func ComputePodsStartupStatus(pods []*corev1.Pod, expected int) PodsStartupStatu
 			if ready {
 				// Only count a pod is running when it is also ready.
 				startupStatus.Running++
+				if isPodUpdated == nil {
+					startupStatus.RunningUpdated++
+				} else {
+					if err := isPodUpdated(p); err != nil {
+						startupStatus.LastIsPodUpdatedError = err
+					} else {
+						startupStatus.RunningUpdated++
+					}
+				}
 			} else {
 				startupStatus.RunningButNotReady++
 			}
@@ -90,7 +154,7 @@ func ComputePodsStartupStatus(pods []*corev1.Pod, expected int) PodsStartupStatu
 	return startupStatus
 }
 
-type podInfo struct {
+type podDiffInfo struct {
 	oldHostname string
 	oldPhase    string
 	hostname    string
@@ -98,7 +162,7 @@ type podInfo struct {
 }
 
 // PodDiff represets diff between old and new group of pods.
-type PodDiff map[string]*podInfo
+type PodDiff map[string]*podDiffInfo
 
 // Print formats and prints the give PodDiff.
 func (p PodDiff) String(ignorePhases sets.String) string {
@@ -140,8 +204,8 @@ func (p PodDiff) String(ignorePhases sets.String) string {
 // and then disappeared.
 func (p PodDiff) DeletedPods() []string {
 	var deletedPods []string
-	for podName, podInfo := range p {
-		if podInfo.hostname == nonExist {
+	for podName, podDiffInfo := range p {
+		if podDiffInfo.hostname == nonExist {
 			deletedPods = append(deletedPods, podName)
 		}
 	}
@@ -151,8 +215,8 @@ func (p PodDiff) DeletedPods() []string {
 // AddedPods returns a slice of pods that were added.
 func (p PodDiff) AddedPods() []string {
 	var addedPods []string
-	for podName, podInfo := range p {
-		if podInfo.oldHostname == nonExist {
+	for podName, podDiffInfo := range p {
+		if podDiffInfo.oldHostname == nonExist {
 			addedPods = append(addedPods, podName)
 		}
 	}
@@ -161,20 +225,73 @@ func (p PodDiff) AddedPods() []string {
 
 // DiffPods computes a PodDiff given 2 lists of pods.
 func DiffPods(oldPods []*corev1.Pod, curPods []*corev1.Pod) PodDiff {
-	podInfoMap := PodDiff{}
+	podDiffInfoMap := PodDiff{}
 
 	// New pods will show up in the curPods list but not in oldPods. They have oldhostname/phase == nonexist.
 	for _, pod := range curPods {
-		podInfoMap[pod.Name] = &podInfo{hostname: pod.Spec.NodeName, phase: string(pod.Status.Phase), oldHostname: nonExist, oldPhase: nonExist}
+		podDiffInfoMap[pod.Name] = &podDiffInfo{hostname: pod.Spec.NodeName, phase: string(pod.Status.Phase), oldHostname: nonExist, oldPhase: nonExist}
 	}
 
 	// Deleted pods will show up in the oldPods list but not in curPods. They have a hostname/phase == nonexist.
 	for _, pod := range oldPods {
-		if info, ok := podInfoMap[pod.Name]; ok {
+		if info, ok := podDiffInfoMap[pod.Name]; ok {
 			info.oldHostname, info.oldPhase = pod.Spec.NodeName, string(pod.Status.Phase)
 		} else {
-			podInfoMap[pod.Name] = &podInfo{hostname: nonExist, phase: nonExist, oldHostname: pod.Spec.NodeName, oldPhase: string(pod.Status.Phase)}
+			podDiffInfoMap[pod.Name] = &podDiffInfo{hostname: nonExist, phase: nonExist, oldHostname: pod.Spec.NodeName, oldPhase: string(pod.Status.Phase)}
 		}
 	}
-	return podInfoMap
+	return podDiffInfoMap
+}
+
+type PodInfo struct {
+	Name      string
+	Hostname  string
+	Phase     string
+	Status    Status
+	Namespace string
+}
+
+func (p *PodInfo) String() string {
+	return fmt.Sprintf("{%v %v %v %v %v}", p.Namespace, p.Name, p.Phase, p.Status.String(), p.Hostname)
+}
+
+// PodsStatus is a collection of current pod phases and node assignments data.
+type PodsStatus struct {
+	Info []*PodInfo
+}
+
+// ComputePodsStatus computes PodsStatus for a group of pods.
+func ComputePodsStatus(pods []*corev1.Pod) *PodsStatus {
+	ps := &PodsStatus{
+		Info: make([]*PodInfo, len(pods)),
+	}
+	for i := range pods {
+		ps.Info[i] = &PodInfo{
+			Name:      pods[i].Name,
+			Hostname:  pods[i].Spec.NodeName,
+			Phase:     string(pods[i].Status.Phase),
+			Status:    podStatus(pods[i]),
+			Namespace: pods[i].Namespace,
+		}
+	}
+	return ps
+}
+
+// String returns string representation of a PodsStatus.
+func (ps *PodsStatus) String() string {
+	return fmt.Sprintf("%v", ps.Info)
+}
+
+func (ps *PodsStatus) NotRunningAndReady() *PodsStatus {
+	res := &PodsStatus{
+		Info: make([]*PodInfo, 0),
+	}
+
+	for _, info := range ps.Info {
+		if info.Status != RunningAndReady {
+			res.Info = append(res.Info, info)
+		}
+	}
+
+	return res
 }

@@ -21,18 +21,19 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 	"k8s.io/perf-tests/clusterloader2/pkg/measurement/util"
+	"k8s.io/perf-tests/clusterloader2/pkg/provider"
 )
 
-// KubemarkResourceUsage represents resources used by the kubemark.
-type KubemarkResourceUsage struct {
+// ResourceUsage represents resources used by the kubemark.
+type ResourceUsage struct {
 	Name                    string
 	MemoryWorkingSetInBytes uint64
 	CPUUsageInCores         float64
 }
 
-func getMasterUsageByPrefix(host, provider, prefix string) (string, error) {
+func getMasterUsageByPrefix(host string, provider provider.Provider, prefix string) (string, error) {
 	sshResult, err := util.SSH(fmt.Sprintf("ps ax -o %%cpu,rss,command | tail -n +2 | grep %v | sed 's/\\s+/ /g'", prefix), host+":22", provider)
 	if err != nil {
 		return "", err
@@ -42,12 +43,12 @@ func getMasterUsageByPrefix(host, provider, prefix string) (string, error) {
 
 // GetKubemarkMasterComponentsResourceUsage returns resource usage of the kubemark components.
 // TODO: figure out how to move this to kubemark directory (need to factor test SSH out of e2e framework)
-func GetKubemarkMasterComponentsResourceUsage(host, provider string) map[string]*KubemarkResourceUsage {
-	result := make(map[string]*KubemarkResourceUsage)
+func GetKubemarkMasterComponentsResourceUsage(host string, provider provider.Provider) map[string]*ResourceUsage {
+	result := make(map[string]*ResourceUsage)
 	// Get kubernetes component resource usage
 	sshResult, err := getMasterUsageByPrefix(host, provider, "kube")
 	if err != nil {
-		glog.Errorf("error when trying to SSH to master machine. Skipping probe. %v", err)
+		klog.Errorf("error when trying to SSH to master machine. Skipping probe. %v", err)
 		return nil
 	}
 	scanner := bufio.NewScanner(strings.NewReader(sshResult))
@@ -55,17 +56,19 @@ func GetKubemarkMasterComponentsResourceUsage(host, provider string) map[string]
 		var cpu float64
 		var mem uint64
 		var name string
-		fmt.Sscanf(strings.TrimSpace(scanner.Text()), "%f %d /usr/local/bin/kube-%s", &cpu, &mem, &name)
+		if _, err := fmt.Sscanf(strings.TrimSpace(scanner.Text()), "%f %d /usr/local/bin/kube-%s", &cpu, &mem, &name); err == nil {
+			klog.Errorf("error parsing component resource usage %s. Skipping. %v", name, err)
+		}
 		if name != "" {
 			// Gatherer expects pod_name/container_name format
 			fullName := name + "/" + name
-			result[fullName] = &KubemarkResourceUsage{Name: fullName, MemoryWorkingSetInBytes: mem * 1024, CPUUsageInCores: cpu / 100}
+			result[fullName] = &ResourceUsage{Name: fullName, MemoryWorkingSetInBytes: mem * 1024, CPUUsageInCores: cpu / 100}
 		}
 	}
 	// Get etcd resource usage
-	sshResult, err = getMasterUsageByPrefix("bin/etcd", host, provider)
+	sshResult, err = getMasterUsageByPrefix(host, provider, "bin/etcd")
 	if err != nil {
-		glog.Errorf("error when trying to SSH to master machine. Skipping probe")
+		klog.Errorf("error when trying to SSH to master machine. Skipping probe")
 		return nil
 	}
 	scanner = bufio.NewScanner(strings.NewReader(sshResult))
@@ -73,16 +76,20 @@ func GetKubemarkMasterComponentsResourceUsage(host, provider string) map[string]
 		var cpu float64
 		var mem uint64
 		var etcdKind string
-		fmt.Sscanf(strings.TrimSpace(scanner.Text()), "%f %d /bin/sh -c /usr/local/bin/etcd", &cpu, &mem)
+		if _, err := fmt.Sscanf(strings.TrimSpace(scanner.Text()), "%f %d /usr/local/bin/etcd", &cpu, &mem); err == nil {
+			klog.Errorf("error parsing etcd resource usage, skipping. %v", err)
+		}
 		dataDirStart := strings.Index(scanner.Text(), "--data-dir")
 		if dataDirStart < 0 {
 			continue
 		}
-		fmt.Sscanf(scanner.Text()[dataDirStart:], "--data-dir=/var/%s", &etcdKind)
+		if _, err := fmt.Sscanf(scanner.Text()[dataDirStart:], "--data-dir /var/%s", &etcdKind); err != nil {
+			klog.Errorf("error parsing etcd data-dir. Skipping. %v", err)
+		}
 		if etcdKind != "" {
 			// Gatherer expects pod_name/container_name format
 			fullName := "etcd/" + etcdKind
-			result[fullName] = &KubemarkResourceUsage{Name: fullName, MemoryWorkingSetInBytes: mem * 1024, CPUUsageInCores: cpu / 100}
+			result[fullName] = &ResourceUsage{Name: fullName, MemoryWorkingSetInBytes: mem * 1024, CPUUsageInCores: cpu / 100}
 		}
 	}
 	return result

@@ -17,107 +17,54 @@ limitations under the License.
 package runtimeobjects
 
 import (
+	"context"
 	"fmt"
 	"strconv"
+	"sync"
 
+	goerrors "github.com/go-errors/errors"
+	gocmp "github.com/google/go-cmp/cmp"
+	appsv1 "k8s.io/api/apps/v1"
 	batch "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	extensions "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/perf-tests/clusterloader2/pkg/framework/client"
 )
 
-// ListRuntimeObjectsForKind returns objects of given kind that satisfy given namespace, labelSelector and fieldSelector.
-func ListRuntimeObjectsForKind(c clientset.Interface, kind, namespace, labelSelector, fieldSelector string) ([]runtime.Object, error) {
+// ListRuntimeObjectsForKind returns objects of given gvr that satisfy given labelSelector and fieldSelector.
+func ListRuntimeObjectsForKind(d dynamic.Interface, gvr schema.GroupVersionResource, labelSelector, fieldSelector string) ([]runtime.Object, error) {
 	var runtimeObjectsList []runtime.Object
 	var listFunc func() error
 	listOpts := metav1.ListOptions{
 		LabelSelector: labelSelector,
 		FieldSelector: fieldSelector,
 	}
-	switch kind {
-	case "ReplicationController":
-		listFunc = func() error {
-			list, err := c.CoreV1().ReplicationControllers(namespace).List(listOpts)
-			if err != nil {
-				return err
-			}
-			runtimeObjectsList = make([]runtime.Object, len(list.Items))
-			for i := range list.Items {
-				runtimeObjectsList[i] = &list.Items[i]
-			}
-			return nil
+	listFunc = func() error {
+		list, err := d.Resource(gvr).List(context.TODO(), listOpts)
+		if err != nil {
+			return err
 		}
-	case "ReplicaSet":
-		listFunc = func() error {
-			list, err := c.ExtensionsV1beta1().ReplicaSets(namespace).List(listOpts)
-			if err != nil {
-				return err
-			}
-			runtimeObjectsList = make([]runtime.Object, len(list.Items))
-			for i := range list.Items {
-				runtimeObjectsList[i] = &list.Items[i]
-			}
-			return nil
+		runtimeObjectsList = make([]runtime.Object, len(list.Items))
+		for i := range list.Items {
+			runtimeObjectsList[i] = &list.Items[i]
 		}
-	case "Deployment":
-		listFunc = func() error {
-			list, err := c.ExtensionsV1beta1().Deployments(namespace).List(listOpts)
-			if err != nil {
-				return err
-			}
-			runtimeObjectsList = make([]runtime.Object, len(list.Items))
-			for i := range list.Items {
-				runtimeObjectsList[i] = &list.Items[i]
-			}
-			return nil
-		}
-	case "DaemonSet":
-		listFunc = func() error {
-			list, err := c.ExtensionsV1beta1().DaemonSets(namespace).List(listOpts)
-			if err != nil {
-				return err
-			}
-			runtimeObjectsList = make([]runtime.Object, len(list.Items))
-			for i := range list.Items {
-				runtimeObjectsList[i] = &list.Items[i]
-			}
-			return nil
-		}
-	case "Job":
-		listFunc = func() error {
-			list, err := c.BatchV1().Jobs(namespace).List(listOpts)
-			if err != nil {
-				return err
-			}
-			runtimeObjectsList = make([]runtime.Object, len(list.Items))
-			for i := range list.Items {
-				runtimeObjectsList[i] = &list.Items[i]
-			}
-			return nil
-		}
-	default:
-		return nil, fmt.Errorf("unsupported kind when getting runtime object: %v", kind)
+		return nil
 	}
 
-	if err := client.RetryWithExponentialBackOff(client.RetryFunction(listFunc, nil)); err != nil {
+	if err := client.RetryWithExponentialBackOff(client.RetryFunction(listFunc)); err != nil {
 		return nil, err
 	}
 	return runtimeObjectsList, nil
-}
-
-// GetNameFromRuntimeObject returns name of given runtime object.
-func GetNameFromRuntimeObject(obj runtime.Object) (string, error) {
-	metaObjectAccessor, ok := obj.(metav1.ObjectMetaAccessor)
-	if !ok {
-		return "", fmt.Errorf("unsupported kind when getting name: %v", obj)
-	}
-	return metaObjectAccessor.GetObjectMeta().GetName(), nil
 }
 
 // GetResourceVersionFromRuntimeObject returns resource version of given runtime object.
@@ -133,31 +80,68 @@ func GetResourceVersionFromRuntimeObject(obj runtime.Object) (uint64, error) {
 	return strconv.ParseUint(version, 10, 64)
 }
 
-// GetNamespaceFromRuntimeObject returns namespace of given runtime object.
-func GetNamespaceFromRuntimeObject(obj runtime.Object) (string, error) {
-	metaObjectAccessor, ok := obj.(metav1.ObjectMetaAccessor)
-	if !ok {
-		return "", fmt.Errorf("unsupported kind when getting namespace: %v", obj)
+// GetIsPodUpdatedPredicateFromRuntimeObject returns a func(*corev1.Pod) bool predicate
+// that can be used to check if given pod represents the desired state of pod.
+func GetIsPodUpdatedPredicateFromRuntimeObject(obj runtime.Object) (func(*corev1.Pod) error, error) {
+	switch typed := obj.(type) {
+	case *unstructured.Unstructured:
+		return getIsPodUpdatedPodPredicateFromUnstructured(typed)
+	default:
+		return nil, goerrors.Errorf("unsupported kind when getting updated pod predicate: %v", obj)
 	}
-	return metaObjectAccessor.GetObjectMeta().GetNamespace(), nil
 }
 
-// GetSelectorFromRuntimeObject returns selector of given runtime object.
-func GetSelectorFromRuntimeObject(obj runtime.Object) (labels.Selector, error) {
-	switch typed := obj.(type) {
-	case *corev1.ReplicationController:
-		return labels.SelectorFromSet(typed.Spec.Selector), nil
-	case *extensions.ReplicaSet:
-		return metav1.LabelSelectorAsSelector(typed.Spec.Selector)
-	case *extensions.Deployment:
-		return metav1.LabelSelectorAsSelector(typed.Spec.Selector)
-	case *extensions.DaemonSet:
-		return metav1.LabelSelectorAsSelector(typed.Spec.Selector)
-	case *batch.Job:
-		return metav1.LabelSelectorAsSelector(typed.Spec.Selector)
-	default:
-		return nil, fmt.Errorf("unsupported kind when getting selector: %v", obj)
+// Auxiliary error type for lazy evaluation of gocmp.Diff which is known to be
+// computationally expensive.
+type lazySpecDiffError struct {
+	templateSpec corev1.PodSpec
+	podSpec      corev1.PodSpec
+}
+
+func (lsde *lazySpecDiffError) Error() string {
+	return fmt.Sprintf("Not matching templates, diff: %v", gocmp.Diff(lsde.templateSpec, lsde.podSpec))
+}
+
+type podCacheKey struct {
+	uid types.UID
+	rv  string
+}
+
+func getIsPodUpdatedPodPredicateFromUnstructured(obj *unstructured.Unstructured) (func(_ *corev1.Pod) error, error) {
+	templateMap, ok, err := unstructured.NestedMap(obj.UnstructuredContent(), "spec", "template")
+	if err != nil {
+		return nil, goerrors.Errorf("failed to get pod template: %v", err)
 	}
+	if !ok {
+		return nil, goerrors.Errorf("spec.template is not set in object %v", obj.UnstructuredContent())
+	}
+	template := corev1.PodTemplateSpec{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(templateMap, &template); err != nil {
+		return nil, goerrors.Errorf("failed to parse spec.template as v1.PodTemplateSpec")
+	}
+
+	cache := make(map[podCacheKey]error)
+	var mu sync.Mutex
+
+	return func(pod *corev1.Pod) error {
+		key := podCacheKey{uid: pod.UID, rv: pod.ResourceVersion}
+		mu.Lock()
+		if cachedErr, exists := cache[key]; exists {
+			mu.Unlock()
+			return cachedErr
+		}
+		mu.Unlock()
+
+		var err error
+		if !equality.Semantic.DeepDerivative(template.Spec, pod.Spec) {
+			err = &lazySpecDiffError{template.Spec, pod.Spec}
+		}
+
+		mu.Lock()
+		cache[key] = err
+		mu.Unlock()
+		return err
+	}, nil
 }
 
 // GetSpecFromRuntimeObject returns spec of given runtime object.
@@ -166,49 +150,243 @@ func GetSpecFromRuntimeObject(obj runtime.Object) (interface{}, error) {
 		return nil, nil
 	}
 	switch typed := obj.(type) {
+	case *unstructured.Unstructured:
+		return getSpecFromUnstrutured(typed)
 	case *corev1.ReplicationController:
 		return typed.Spec, nil
-	case *extensions.ReplicaSet:
+	case *appsv1.ReplicaSet:
 		return typed.Spec, nil
-	case *extensions.Deployment:
+	case *appsv1.Deployment:
 		return typed.Spec, nil
-	case *extensions.DaemonSet:
+	case *appsv1.StatefulSet:
+		return typed.Spec, nil
+	case *appsv1.DaemonSet:
 		return typed.Spec, nil
 	case *batch.Job:
 		return typed.Spec, nil
 	default:
-		return nil, fmt.Errorf("unsupported kind when getting selector: %v", obj)
+		return nil, fmt.Errorf("unsupported kind when getting spec: %v", obj)
 	}
 }
 
+// Note: This function assumes each controller has field Spec.
+func getSpecFromUnstrutured(obj *unstructured.Unstructured) (map[string]interface{}, error) {
+	spec, ok, err := unstructured.NestedMap(obj.UnstructuredContent(), "spec")
+	if err != nil {
+		return nil, fmt.Errorf("try to acquire spec failed, %v", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("try to acquire spec failed, no field spec for obj %s", obj.GetName())
+	}
+	return spec, nil
+}
+
 // GetReplicasFromRuntimeObject returns replicas number from given runtime object.
-func GetReplicasFromRuntimeObject(obj runtime.Object) (int32, error) {
+func GetReplicasFromRuntimeObject(c clientset.Interface, obj runtime.Object) (ReplicasWatcher, error) {
+	if obj == nil {
+		return &ConstReplicas{0}, nil
+	}
 	switch typed := obj.(type) {
+	case *unstructured.Unstructured:
+		return getReplicasFromUnstrutured(c, typed)
 	case *corev1.ReplicationController:
 		if typed.Spec.Replicas != nil {
-			return *typed.Spec.Replicas, nil
+			return &ConstReplicas{int(*typed.Spec.Replicas)}, nil
 		}
-		return 0, nil
-	case *extensions.ReplicaSet:
+		return &ConstReplicas{0}, nil
+	case *appsv1.ReplicaSet:
 		if typed.Spec.Replicas != nil {
-			return *typed.Spec.Replicas, nil
+			return &ConstReplicas{int(*typed.Spec.Replicas)}, nil
 		}
-		return 0, nil
-	case *extensions.Deployment:
+		return &ConstReplicas{0}, nil
+	case *appsv1.Deployment:
 		if typed.Spec.Replicas != nil {
-			return *typed.Spec.Replicas, nil
+			return &ConstReplicas{int(*typed.Spec.Replicas)}, nil
 		}
-		return 0, nil
-	case *extensions.DaemonSet:
-		return 0, nil
+		return &ConstReplicas{0}, nil
+	case *appsv1.StatefulSet:
+		if typed.Spec.Replicas != nil {
+			return &ConstReplicas{int(*typed.Spec.Replicas)}, nil
+		}
+		return &ConstReplicas{0}, nil
+	case *appsv1.DaemonSet:
+		return getDaemonSetNumSchedulableNodes(c, &typed.Spec.Template.Spec)
 	case *batch.Job:
 		if typed.Spec.Parallelism != nil {
-			return *typed.Spec.Parallelism, nil
+			return &ConstReplicas{int(*typed.Spec.Parallelism)}, nil
 		}
-		return 0, nil
+		return &ConstReplicas{0}, nil
 	default:
-		return -1, fmt.Errorf("unsupported kind when getting number of replicas: %v", obj)
+		return nil, fmt.Errorf("unsupported kind when getting number of replicas: %v", obj)
 	}
+}
+
+// getDaemonSetNumSchedulableNodes returns the number of schedulable nodes matching both nodeSelector and NodeAffinity.
+func getDaemonSetNumSchedulableNodes(c clientset.Interface, podSpec *corev1.PodSpec) (ReplicasWatcher, error) {
+	selector, err := metav1.LabelSelectorAsSelector(metav1.SetAsLabelSelector(podSpec.NodeSelector))
+	if err != nil {
+		return nil, err
+	}
+	return NewNodeCounter(c, selector, podSpec.Affinity, podSpec.Tolerations), nil
+}
+
+// Note: This function assumes each controller has field Spec.Replicas, except DaemonSets and Job.
+func getReplicasFromUnstrutured(c clientset.Interface, obj *unstructured.Unstructured) (ReplicasWatcher, error) {
+	spec, err := getSpecFromUnstrutured(obj)
+	if err != nil {
+		return nil, err
+	}
+	return tryAcquireReplicasFromUnstructuredSpec(c, spec, obj.GetKind())
+}
+
+func tryAcquireReplicasFromUnstructuredSpec(c clientset.Interface, spec map[string]interface{}, kind string) (ReplicasWatcher, error) {
+	switch kind {
+	case "DaemonSet":
+		parser, err := newDaemonSetPodSpecParser(spec)
+		if err != nil {
+			return nil, err
+		}
+		var podSpec corev1.PodSpec
+		if err := parser.getDaemonSetNodeSelectorFromUnstructuredSpec(&podSpec); err != nil {
+			return nil, err
+		}
+		if err := parser.getDaemonSetAffinityFromUnstructuredSpec(&podSpec); err != nil {
+			return nil, err
+		}
+		if err := parser.getDaemonSetTolerationsFromUnstructuredSpec(&podSpec); err != nil {
+			return nil, err
+		}
+		return getDaemonSetNumSchedulableNodes(c, &podSpec)
+	case "Job":
+		replicas, found, err := unstructured.NestedInt64(spec, "parallelism")
+		if err != nil {
+			return nil, fmt.Errorf("try to acquire job parallelism failed, %v", err)
+		}
+		if !found {
+			return &ConstReplicas{0}, nil
+		}
+		return &ConstReplicas{int(replicas)}, nil
+	default:
+		replicas, found, err := unstructured.NestedInt64(spec, "replicas")
+		if err != nil {
+			return nil, fmt.Errorf("try to acquire replicas failed, %v", err)
+		}
+		if !found {
+			return &ConstReplicas{0}, nil
+		}
+		return &ConstReplicas{int(replicas)}, nil
+	}
+}
+
+type daemonSetPodSpecParser map[string]interface{}
+
+func newDaemonSetPodSpecParser(spec map[string]interface{}) (daemonSetPodSpecParser, error) {
+	template, found, err := unstructured.NestedMap(spec, "template")
+	if err != nil || !found {
+		return nil, err
+	}
+	podSpec, found, err := unstructured.NestedMap(template, "spec")
+	if err != nil || !found {
+		return nil, err
+	}
+	return podSpec, nil
+}
+
+func (p daemonSetPodSpecParser) getDaemonSetNodeSelectorFromUnstructuredSpec(spec *corev1.PodSpec) error {
+	nodeSelector, _, err := unstructured.NestedStringMap(p, "nodeSelector")
+	spec.NodeSelector = nodeSelector
+	return err
+}
+
+func (p daemonSetPodSpecParser) getDaemonSetAffinityFromUnstructuredSpec(spec *corev1.PodSpec) error {
+	unstructuredAffinity, found, err := unstructured.NestedMap(p, "affinity")
+	if err != nil || !found {
+		return err
+	}
+	affinity := &corev1.Affinity{}
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredAffinity, affinity)
+	spec.Affinity = affinity
+	return err
+}
+
+func addOrUpdateTolerationInPodSpec(spec *corev1.PodSpec, toleration *corev1.Toleration) {
+	var newTolerations []corev1.Toleration
+	updated := false
+	for i := range spec.Tolerations {
+		if toleration.MatchToleration(&spec.Tolerations[i]) {
+			newTolerations = append(newTolerations, *toleration)
+			updated = true
+			continue
+		}
+		newTolerations = append(newTolerations, spec.Tolerations[i])
+	}
+	if !updated {
+		newTolerations = append(newTolerations, *toleration)
+	}
+	spec.Tolerations = newTolerations
+}
+
+// addOrUpdateDaemonPodTolerations adds tolerations that are added to each pod
+// by daemonset controller.
+// NOTICE: keep in sync with
+//
+//	https://github.com/kubernetes/kubernetes/blob/release-1.32/pkg/controller/daemon/util/daemonset_util.go#L48
+func addOrUpdateDaemonPodTolerations(spec *corev1.PodSpec) {
+	tolerations := []corev1.Toleration{
+		{
+			Key:      corev1.TaintNodeNotReady,
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoExecute,
+		},
+		{
+			Key:      corev1.TaintNodeDiskPressure,
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+		{
+			Key:      corev1.TaintNodeMemoryPressure,
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+		{
+			Key:      corev1.TaintNodePIDPressure,
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+		{
+			Key:      corev1.TaintNodeUnschedulable,
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+	}
+
+	if spec.HostNetwork {
+		tolerations = append(tolerations, corev1.Toleration{
+			Key:      corev1.TaintNodeNetworkUnavailable,
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		})
+	}
+	for i := range tolerations {
+		addOrUpdateTolerationInPodSpec(spec, &tolerations[i])
+	}
+}
+
+func (p daemonSetPodSpecParser) getDaemonSetTolerationsFromUnstructuredSpec(spec *corev1.PodSpec) error {
+	addOrUpdateDaemonPodTolerations(spec)
+	unstructuredTolerations, found, err := unstructured.NestedSlice(p, "tolerations")
+	if err != nil || !found {
+		return err
+	}
+	for _, unstructuredToleration := range unstructuredTolerations {
+		var toleration corev1.Toleration
+		err = runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredToleration.(map[string]interface{}), &toleration)
+		if err != nil {
+			break
+		}
+		addOrUpdateTolerationInPodSpec(spec, &toleration)
+	}
+	return err
 }
 
 // IsEqualRuntimeObjectsSpec returns true if given runtime objects have identical specs.
@@ -221,18 +399,40 @@ func IsEqualRuntimeObjectsSpec(runtimeObj1, runtimeObj2 runtime.Object) (bool, e
 	if err != nil {
 		return false, err
 	}
+
 	return equality.Semantic.DeepEqual(runtimeObj1Spec, runtimeObj2Spec), nil
 }
 
-// CreateMetaNamespaceKey returns meta key (namespace/name) for given runtime object.
-func CreateMetaNamespaceKey(obj runtime.Object) (string, error) {
-	namespace, err := GetNamespaceFromRuntimeObject(obj)
-	if err != nil {
-		return "", fmt.Errorf("retrieving namespace error: %v", err)
+// GetNumObjectsMatchingSelector returns number of objects matching the given selector.
+func GetNumObjectsMatchingSelector(c dynamic.Interface, namespace string, resource schema.GroupVersionResource, labelSelector labels.Selector) (int, error) {
+	var numObjects int
+	listFunc := func() error {
+		list, err := c.Resource(resource).Namespace(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labelSelector.String()})
+		if err != nil {
+			return err
+		}
+		numObjects = len(list.Items)
+		return nil
 	}
-	name, err := GetNameFromRuntimeObject(obj)
-	if err != nil {
-		return "", fmt.Errorf("retrieving name error: %v", err)
+	err := client.RetryWithExponentialBackOff(client.RetryFunction(listFunc))
+	return numObjects, err
+}
+
+// The pod can only schedule onto nodes that satisfy requirements in NodeAffinity.
+func podMatchesNodeAffinity(affinity *corev1.Affinity, node *corev1.Node) (bool, error) {
+	// 1. nil NodeSelector matches all nodes (i.e. does not filter out any nodes)
+	// 2. nil []NodeSelectorTerm (equivalent to non-nil empty NodeSelector) matches no nodes
+	// 3. zero-length non-nil []NodeSelectorTerm matches no nodes also, just for simplicity
+	// 4. nil []NodeSelectorRequirement (equivalent to non-nil empty NodeSelectorTerm) matches no nodes
+	// 5. zero-length non-nil []NodeSelectorRequirement matches no nodes also, just for simplicity
+	// 6. non-nil empty NodeSelectorRequirement is not allowed
+	if affinity != nil && affinity.NodeAffinity != nil {
+		nodeAffinity := affinity.NodeAffinity
+		// if no required NodeAffinity requirements, will do no-op, means select all nodes.
+		if nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+			return true, nil
+		}
+		return corev1helpers.MatchNodeSelectorTerms(node, nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
 	}
-	return namespace + "/" + name, nil
+	return true, nil
 }

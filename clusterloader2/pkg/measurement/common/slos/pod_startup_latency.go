@@ -17,58 +17,87 @@ limitations under the License.
 package slos
 
 import (
+	"context"
 	"fmt"
-	"math"
-	"sort"
-	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 	"k8s.io/perf-tests/clusterloader2/pkg/errors"
 	"k8s.io/perf-tests/clusterloader2/pkg/measurement"
 	measurementutil "k8s.io/perf-tests/clusterloader2/pkg/measurement/util"
+	"k8s.io/perf-tests/clusterloader2/pkg/measurement/util/informer"
 	"k8s.io/perf-tests/clusterloader2/pkg/util"
+	"k8s.io/utils/clock"
 )
 
 const (
-	podStartupLatencyThreshold       = 5 * time.Second
-	podStartupLatencyMeasurementName = "PodStartupLatency"
-	informerSyncTimeout              = time.Minute
-	successfulStartupRatioTreshold   = 0.99
+	defaultPodStartupLatencyThreshold = 5 * time.Second
+	defaultSchedulerName              = corev1.DefaultSchedulerName
+	podStartupLatencyMeasurementName  = "PodStartupLatency"
+	informerSyncTimeout               = time.Minute
+
+	// createPhase corresponds to the the time the resource is created, according to the watch stream.
+	// Granularity: Nanoseconds
+	createPhase = "create"
+
+	// SchedulePhase corresponds to the time when the scheduler schedules the pod, according to the watch stream.
+	// Granularity: Nanoseconds
+	schedulePhase = "schedule"
+
+	// runPhase corresponds to the time when the pod is running, according to the watch strema.
+	// Granularity: Nanoseconds
+	runPhase = "run"
+
+	// watchPhase corresponds to the time when the watch sees the pod running for the first time.
+	// Deprecated: this is now equivalent to runPhase.
+	// Granularity: Nanoseconds
+	watchPhase = "watch"
 )
 
 func init() {
-	measurement.Register(podStartupLatencyMeasurementName, createPodStartupLatencyMeasurement)
+	if err := measurement.Register(podStartupLatencyMeasurementName, createPodStartupLatencyMeasurement); err != nil {
+		klog.Fatalf("cant register service %v", err)
+	}
 }
 
 func createPodStartupLatencyMeasurement() measurement.Measurement {
 	return &podStartupLatencyMeasurement{
-		createTimes:   make(map[string]metav1.Time),
-		scheduleTimes: make(map[string]metav1.Time),
-		runTimes:      make(map[string]metav1.Time),
-		watchTimes:    make(map[string]metav1.Time),
-		nodeNames:     make(map[string]string),
+		selector:          util.NewObjectSelector(),
+		podStartupEntries: measurementutil.NewObjectTransitionTimes(podStartupLatencyMeasurementName),
+		podMetadata:       measurementutil.NewPodsMetadata(podStartupLatencyMeasurementName),
+		eventQueue:        workqueue.NewTyped[*eventData](),
+		clock:             clock.RealClock{},
 	}
 }
 
+type eventData struct {
+	obj      interface{}
+	recvTime time.Time
+}
+
 type podStartupLatencyMeasurement struct {
-	namespace     string
-	labelSelector string
-	fieldSelector string
-	informer      cache.SharedInformer
-	isRunning     bool
-	stopCh        chan struct{}
-	mutex         sync.Mutex
-	createTimes   map[string]metav1.Time
-	scheduleTimes map[string]metav1.Time
-	runTimes      map[string]metav1.Time
-	watchTimes    map[string]metav1.Time
-	nodeNames     map[string]string
+	selector  *util.ObjectSelector
+	isRunning bool
+	stopCh    chan struct{}
+	// This queue can potentially grow indefinitely, beacause we put all changes here.
+	// Usually it's not recommended pattern, but we need it for measuring PodStartupLatency.
+	eventQueue        workqueue.TypedInterface[*eventData]
+	podStartupEntries *measurementutil.ObjectTransitionTimes
+	podMetadata       *measurementutil.PodsMetadata
+	threshold         time.Duration
+	// Threshold for pod startup latency by percentile. The default value is threshold.
+	perc50Threshold  time.Duration
+	perc90Threshold  time.Duration
+	perc99Threshold  time.Duration
+	mapEventsByOrder bool
+	clock            clock.Clock
 }
 
 // Execute supports two actions:
@@ -76,32 +105,46 @@ type podStartupLatencyMeasurement struct {
 // - gather - Gathers and prints current pod latency data.
 // Does NOT support concurrency. Multiple calls to this measurement
 // shouldn't be done within one step.
-func (p *podStartupLatencyMeasurement) Execute(config *measurement.MeasurementConfig) ([]measurement.Summary, error) {
-	var summaries []measurement.Summary
+func (p *podStartupLatencyMeasurement) Execute(config *measurement.Config) ([]measurement.Summary, error) {
 	action, err := util.GetString(config.Params, "action")
 	if err != nil {
-		return summaries, err
+		return nil, err
 	}
 
 	switch action {
 	case "start":
-		p.namespace, err = util.GetStringOrDefault(config.Params, "namespace", metav1.NamespaceAll)
-		if err != nil {
-			return summaries, err
+		if err := p.selector.Parse(config.Params); err != nil {
+			return nil, err
 		}
-		p.labelSelector, err = util.GetStringOrDefault(config.Params, "labelSelector", "")
+		p.threshold, err = util.GetDurationOrDefault(config.Params, "threshold", defaultPodStartupLatencyThreshold)
 		if err != nil {
-			return summaries, err
+			return nil, err
 		}
-		p.fieldSelector, err = util.GetStringOrDefault(config.Params, "fieldSelector", "")
+		p.perc50Threshold, err = util.GetDurationOrDefault(config.Params, "perc50Threshold", p.threshold)
 		if err != nil {
-			return summaries, err
+			return nil, err
 		}
-		return summaries, p.start(config.ClientSet)
+		p.perc90Threshold, err = util.GetDurationOrDefault(config.Params, "perc90Threshold", p.threshold)
+		if err != nil {
+			return nil, err
+		}
+		p.perc99Threshold, err = util.GetDurationOrDefault(config.Params, "perc99Threshold", p.threshold)
+		if err != nil {
+			return nil, err
+		}
+		p.mapEventsByOrder, err = util.GetBoolOrDefault(config.Params, "mapEventsByOrder", false)
+		if err != nil {
+			return nil, err
+		}
+		return nil, p.start(config.ClusterFramework.GetClientSets().GetClient())
 	case "gather":
-		return p.gather(config.ClientSet)
+		schedulerName, err := util.GetStringOrDefault(config.Params, "schedulerName", defaultSchedulerName)
+		if err != nil {
+			return nil, err
+		}
+		return p.gather(config.ClusterFramework.GetClientSets().GetClient(), config.Identifier, schedulerName)
 	default:
-		return summaries, fmt.Errorf("unknown action %v", action)
+		return nil, fmt.Errorf("unknown action %v", action)
 	}
 
 }
@@ -112,254 +155,196 @@ func (p *podStartupLatencyMeasurement) Dispose() {
 }
 
 // String returns string representation of this measurement.
-func (*podStartupLatencyMeasurement) String() string {
-	return podStartupLatencyMeasurementName
+func (p *podStartupLatencyMeasurement) String() string {
+	return podStartupLatencyMeasurementName + ": " + p.selector.String()
 }
 
 func (p *podStartupLatencyMeasurement) start(c clientset.Interface) error {
 	if p.isRunning {
-		glog.Infof("%s: pod startup latancy measurement already running", p)
+		klog.V(2).Infof("%s: pod startup latancy measurement already running", p)
 		return nil
 	}
-	glog.Infof("%s: starting pod startup latency measurement...", p)
+	klog.V(2).Infof("%s: starting pod startup latency measurement...", p)
 	p.isRunning = true
 	p.stopCh = make(chan struct{})
-	optionsModifier := func(options *metav1.ListOptions) {
-		options.FieldSelector = p.fieldSelector
-		options.LabelSelector = p.labelSelector
-	}
-	listerWatcher := cache.NewFilteredListWatchFromClient(c.CoreV1().RESTClient(), "pods", p.namespace, optionsModifier)
-	p.informer = cache.NewSharedInformer(listerWatcher, &corev1.Pod{}, 0)
-	p.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			p.checkPod(obj)
+	i := informer.NewInformer(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				p.selector.ApplySelectors(&options)
+				return c.CoreV1().Pods(p.selector.Namespace).List(context.TODO(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				p.selector.ApplySelectors(&options)
+				return c.CoreV1().Pods(p.selector.Namespace).Watch(context.TODO(), options)
+			},
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			p.checkPod(newObj)
-		},
-	})
+		p.addEvent,
+	)
+	go p.processEvents()
+	return informer.StartAndSync(i, p.stopCh, informerSyncTimeout)
+}
 
-	go p.informer.Run(p.stopCh)
-	timeoutCh := make(chan struct{})
-	timeoutTimer := time.AfterFunc(informerSyncTimeout, func() {
-		close(timeoutCh)
-	})
-	defer timeoutTimer.Stop()
-	if !cache.WaitForCacheSync(timeoutCh, p.informer.HasSynced) {
-		return fmt.Errorf("timed out waiting for caches to sync")
+func (p *podStartupLatencyMeasurement) addEvent(_, obj interface{}) {
+	event := &eventData{obj: obj, recvTime: p.clock.Now()}
+	p.eventQueue.Add(event)
+}
+
+func (p *podStartupLatencyMeasurement) processEvents() {
+	for p.processNextWorkItem() {
 	}
-	return nil
+}
+
+func (p *podStartupLatencyMeasurement) processNextWorkItem() bool {
+	item, quit := p.eventQueue.Get()
+	if quit {
+		return false
+	}
+	defer p.eventQueue.Done(item)
+
+	p.processEvent(item)
+	return true
 }
 
 func (p *podStartupLatencyMeasurement) stop() {
 	if p.isRunning {
 		p.isRunning = false
 		close(p.stopCh)
+		p.eventQueue.ShutDown()
 	}
 }
 
-func (p *podStartupLatencyMeasurement) gather(c clientset.Interface) ([]measurement.Summary, error) {
-	glog.Infof("%s: gathering pod startup latency measurement...", p)
-	if !p.isRunning {
-		return []measurement.Summary{}, fmt.Errorf("metric %s has not been started", podStartupLatencyMeasurementName)
-	}
+var podStartupTransitions = map[string]measurementutil.Transition{
+	"create_to_schedule": {
+		From: createPhase,
+		To:   schedulePhase,
+	},
+	"schedule_to_run": {
+		From: schedulePhase,
+		To:   runPhase,
+	},
+	"run_to_watch": {
+		From: runPhase,
+		To:   watchPhase,
+	},
+	"schedule_to_watch": {
+		From: schedulePhase,
+		To:   watchPhase,
+	},
+	"pod_startup": {
+		From: createPhase,
+		To:   watchPhase,
+	},
+	"create_to_run": {
+		From: createPhase,
+		To:   runPhase,
+	},
+}
 
-	scheduleLag := make([]podLatencyData, 0)
-	startupLag := make([]podLatencyData, 0)
-	watchLag := make([]podLatencyData, 0)
-	schedToWatchLag := make([]podLatencyData, 0)
-	e2eLag := make([]podLatencyData, 0)
+func podStartupTransitionsWithThreshold(threshold time.Duration) map[string]measurementutil.Transition {
+	result := make(map[string]measurementutil.Transition)
+	for key, value := range podStartupTransitions {
+		result[key] = value
+	}
+	podStartupTransition := result["pod_startup"]
+	podStartupTransition.Threshold = threshold
+	result["pod_startup"] = podStartupTransition
+	return result
+}
+
+type podStartupLatencyCheck struct {
+	namePrefix string
+	filter     measurementutil.KeyFilterFunc
+}
+
+func (p *podStartupLatencyMeasurement) gather(c clientset.Interface, identifier string, schedulerName string) ([]measurement.Summary, error) {
+	klog.V(2).Infof("%s: gathering pod startup latency measurement...", p)
+	if !p.isRunning {
+		return nil, fmt.Errorf("metric %s has not been started", podStartupLatencyMeasurementName)
+	}
 
 	p.stop()
 
-	if err := p.gatherScheduleTimes(c); err != nil {
-		return []measurement.Summary{}, err
-	}
-	for key, create := range p.createTimes {
-		sched, ok := p.scheduleTimes[key]
-		if !ok {
-			glog.Infof("%s: failed to find schedule time for %v", p, key)
-			continue
-		}
-		run, ok := p.runTimes[key]
-		if !ok {
-			glog.Infof("%s: failed to find run time for %v", p, key)
-			continue
-		}
-		watch, ok := p.watchTimes[key]
-		if !ok {
-			glog.Infof("%s: failed to find watch time for %v", p, key)
-			continue
-		}
-		node, ok := p.nodeNames[key]
-		if !ok {
-			glog.Infof("%s: failed to find node for %v", p, key)
-			continue
-		}
-
-		scheduleLag = append(scheduleLag, podLatencyData{Name: key, Node: node, Latency: sched.Time.Sub(create.Time)})
-		startupLag = append(startupLag, podLatencyData{Name: key, Node: node, Latency: run.Time.Sub(sched.Time)})
-		watchLag = append(watchLag, podLatencyData{Name: key, Node: node, Latency: watch.Time.Sub(run.Time)})
-		schedToWatchLag = append(schedToWatchLag, podLatencyData{Name: key, Node: node, Latency: watch.Time.Sub(sched.Time)})
-		e2eLag = append(e2eLag, podLatencyData{Name: key, Node: node, Latency: watch.Time.Sub(create.Time)})
+	checks := []podStartupLatencyCheck{
+		{
+			namePrefix: "",
+			filter:     measurementutil.MatchAll,
+		},
+		{
+			namePrefix: "Stateless",
+			filter:     p.podMetadata.FilterStateless,
+		},
+		{
+			namePrefix: "Stateful",
+			filter:     p.podMetadata.FilterStateful,
+		},
 	}
 
-	sort.Sort(podLatencySlice(scheduleLag))
-	sort.Sort(podLatencySlice(startupLag))
-	sort.Sort(podLatencySlice(watchLag))
-	sort.Sort(podLatencySlice(schedToWatchLag))
-	sort.Sort(podLatencySlice(e2eLag))
-
-	p.printLatencies(scheduleLag, "worst create-to-schedule latencies")
-	p.printLatencies(startupLag, "worst schedule-to-run latencies")
-	p.printLatencies(watchLag, "worst run-to-watch latencies")
-	p.printLatencies(schedToWatchLag, "worst schedule-to-watch latencies")
-	p.printLatencies(e2eLag, "worst e2e latencies")
-
-	podStartupLatency := &podStartupLatency{
-		CreateToScheduleLatency: extractLatencyMetrics(scheduleLag),
-		ScheduleToRunLatency:    extractLatencyMetrics(startupLag),
-		RunToWatchLatency:       extractLatencyMetrics(watchLag),
-		ScheduleToWatchLatency:  extractLatencyMetrics(schedToWatchLag),
-		E2ELatency:              extractLatencyMetrics(e2eLag),
-	}
-
+	var summaries []measurement.Summary
 	var err error
-	if successRatio := float32(len(startupLag)) / float32(len(p.createTimes)); successRatio < successfulStartupRatioTreshold {
-		err = fmt.Errorf("only %v%% of all pods were scheduled successfully", successRatio*100)
-		glog.Errorf("%s: %v", p, err)
-	}
+	for _, check := range checks {
+		transitions := podStartupTransitionsWithThreshold(p.threshold)
+		podStartupLatency := p.podStartupEntries.CalculateTransitionsLatency(transitions, check.filter)
 
-	podStartupLatencyThreshold := &measurementutil.LatencyMetric{
-		Perc50: podStartupLatencyThreshold,
-		Perc90: podStartupLatencyThreshold,
-		Perc99: podStartupLatencyThreshold,
-	}
-
-	if slosErr := podStartupLatency.E2ELatency.VerifyThreshod(podStartupLatencyThreshold); slosErr != nil {
-		err = errors.NewMetricViolationError("pod startup", slosErr.Error())
-		glog.Errorf("%s: %v", p, err)
-	}
-	return []measurement.Summary{podStartupLatency}, err
-}
-
-func (p *podStartupLatencyMeasurement) gatherScheduleTimes(c clientset.Interface) error {
-	selector := fields.Set{
-		"involvedObject.kind": "Pod",
-		"source":              corev1.DefaultSchedulerName,
-	}.AsSelector().String()
-	options := metav1.ListOptions{FieldSelector: selector}
-	schedEvents, err := c.CoreV1().Events(p.namespace).List(options)
-	if err != nil {
-		return err
-	}
-	for _, event := range schedEvents.Items {
-		key := createMetaNamespaceKey(event.InvolvedObject.Namespace, event.InvolvedObject.Name)
-		if _, ok := p.createTimes[key]; ok {
-			p.scheduleTimes[key] = event.FirstTimestamp
+		if slosErr := podStartupLatency["pod_startup"].VerifyThresholdByPercentile(p.perc50Threshold, p.perc90Threshold, p.perc99Threshold); slosErr != nil {
+			err = errors.NewMetricViolationError("pod startup", slosErr.Error())
+			klog.Errorf("%s%s: %v", check.namePrefix, p, err)
 		}
+
+		content, jsonErr := util.PrettyPrintJSON(measurementutil.LatencyMapToPerfData(podStartupLatency))
+		if jsonErr != nil {
+			return nil, jsonErr
+		}
+		summaryName := fmt.Sprintf("%s%s_%s", check.namePrefix, podStartupLatencyMeasurementName, identifier)
+		summaries = append(summaries, measurement.CreateSummary(summaryName, "json", content))
 	}
-	return nil
+	return summaries, err
 }
 
-func (p *podStartupLatencyMeasurement) checkPod(obj interface{}) {
+func (p *podStartupLatencyMeasurement) processEvent(event *eventData) {
+	obj, recvTime := event.obj, event.recvTime
+	if obj == nil {
+		return
+	}
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return
 	}
-	if pod.Status.Phase == corev1.PodRunning {
-		p.mutex.Lock()
-		defer p.mutex.Unlock()
-		key := createMetaNamespaceKey(pod.Namespace, pod.Name)
-		if _, found := p.watchTimes[key]; !found {
-			p.watchTimes[key] = metav1.Now()
-			p.createTimes[key] = pod.CreationTimestamp
-			p.nodeNames[key] = pod.Spec.NodeName
-			var startTime metav1.Time
-			for _, cs := range pod.Status.ContainerStatuses {
-				if cs.State.Running != nil {
-					if startTime.Before(&cs.State.Running.StartedAt) {
-						startTime = cs.State.Running.StartedAt
-					}
-				}
-			}
-			if startTime != metav1.NewTime(time.Time{}) {
-				p.runTimes[key] = startTime
-			} else {
-				glog.Errorf("%s: pod %v (%v) is reported to be running, but none of its containers is", p, pod.Name, pod.Namespace)
-			}
+
+	key := createMetaNamespaceKey(pod.Namespace, pod.Name)
+	p.podMetadata.SetStateless(key, isPodStateless(pod))
+
+	// Check if pod is scheduled and if so set schedulePhase if it's not set already.
+	if pod.Spec.NodeName != "" {
+		if _, found := p.podStartupEntries.Get(key, schedulePhase); !found {
+			p.podStartupEntries.Set(key, schedulePhase, recvTime)
 		}
 	}
-}
 
-func (p *podStartupLatencyMeasurement) printLatencies(latencies []podLatencyData, header string) {
-	metrics := extractLatencyMetrics(latencies)
-	glog.Infof("%s: 10%% %s: %v", p, header, latencies[(len(latencies)*9)/10:])
-	glog.Infof("%s: perc50: %v, perc90: %v, perc99: %v", p, metrics.Perc50, metrics.Perc90, metrics.Perc99)
-}
-
-type podLatencyData struct {
-	Name    string
-	Node    string
-	Latency time.Duration
-}
-
-type podLatencySlice []podLatencyData
-
-func (a podLatencySlice) Len() int           { return len(a) }
-func (a podLatencySlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a podLatencySlice) Less(i, j int) bool { return a[i].Latency < a[j].Latency }
-
-type podStartupLatency struct {
-	CreateToScheduleLatency measurementutil.LatencyMetric `json:"createToScheduleLatency"`
-	ScheduleToRunLatency    measurementutil.LatencyMetric `json:"scheduleToRunLatency"`
-	RunToWatchLatency       measurementutil.LatencyMetric `json:"runToWatchLatency"`
-	ScheduleToWatchLatency  measurementutil.LatencyMetric `json:"scheduleToWatchLatency"`
-	E2ELatency              measurementutil.LatencyMetric `json:"e2eLatency"`
-}
-
-// SummaryName returns name of the summary.
-func (p *podStartupLatency) SummaryName() string {
-	return podStartupLatencyMeasurementName
-}
-
-// PrintSummary returns summary as a string.
-func (p *podStartupLatency) PrintSummary() (string, error) {
-	return util.PrettyPrintJSON(podStartupLatencyToPerfData(p))
-}
-
-func extractLatencyMetrics(latencies []podLatencyData) measurementutil.LatencyMetric {
-	length := len(latencies)
-	perc50 := latencies[int(math.Ceil(float64(length*50)/100))-1].Latency
-	perc90 := latencies[int(math.Ceil(float64(length*90)/100))-1].Latency
-	perc99 := latencies[int(math.Ceil(float64(length*99)/100))-1].Latency
-	return measurementutil.LatencyMetric{Perc50: perc50, Perc90: perc90, Perc99: perc99}
-}
-
-func latencyToPerfData(l measurementutil.LatencyMetric, name string) measurementutil.DataItem {
-	return measurementutil.DataItem{
-		Data: map[string]float64{
-			"Perc50": float64(l.Perc50) / 1000000, // ns -> ms
-			"Perc90": float64(l.Perc90) / 1000000,
-			"Perc99": float64(l.Perc99) / 1000000,
-		},
-		Unit: "ms",
-		Labels: map[string]string{
-			"Metric": name,
-		},
+	// Check if pod is running and if so set runPhase if it's not set already.
+	if pod.Status.Phase == corev1.PodRunning {
+		if _, found := p.podStartupEntries.Get(key, runPhase); !found {
+			p.podStartupEntries.Set(key, runPhase, recvTime)
+			p.podStartupEntries.Set(key, watchPhase, recvTime)
+		}
 	}
-}
 
-func podStartupLatencyToPerfData(latency *podStartupLatency) *measurementutil.PerfData {
-	perfData := &measurementutil.PerfData{Version: currentApiCallMetricsVersion}
-	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.CreateToScheduleLatency, "create_to_schedule"))
-	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.ScheduleToRunLatency, "schedule_to_run"))
-	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.RunToWatchLatency, "run_to_watch"))
-	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.ScheduleToWatchLatency, "schedule_to_watch"))
-	perfData.DataItems = append(perfData.DataItems, latencyToPerfData(latency.E2ELatency, "pod_startup"))
-	return perfData
+	// Check if this is the first time we see this pod and if so set createPhase.
+	if _, found := p.podStartupEntries.Get(key, createPhase); !found {
+		p.podStartupEntries.Set(key, createPhase, recvTime)
+	}
 }
 
 func createMetaNamespaceKey(namespace, name string) string {
 	return namespace + "/" + name
+}
+
+func isPodStateless(pod *corev1.Pod) bool {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.EmptyDir != nil || volume.DownwardAPI != nil || volume.ConfigMap != nil || volume.Secret != nil || volume.Projected != nil {
+			continue
+		}
+		klog.V(4).Infof("pod %s/%s classified as stateful", pod.Namespace, pod.Name)
+		return false
+	}
+	return true
 }

@@ -1,0 +1,172 @@
+/*
+Copyright 2019 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package informer
+
+import (
+	"fmt"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
+	"k8s.io/perf-tests/clusterloader2/pkg/util"
+)
+
+func TrimManagedFields(obj interface{}) (interface{}, error) {
+	if accessor, err := meta.Accessor(obj); err == nil && accessor.GetManagedFields() != nil {
+		accessor.SetManagedFields(nil)
+	}
+	return obj, nil
+}
+
+// NewInformer creates a new informer.
+func NewInformer(
+	lw cache.ListerWatcher,
+	handleObj func(interface{}, interface{}),
+) cache.SharedInformer {
+	informer := cache.NewSharedInformer(lw, nil, 0)
+	if err := informer.SetTransform(TrimManagedFields); err != nil {
+		klog.Errorf("cannot set transform: %v", err)
+	}
+	addEventHandler(informer, handleObj)
+	return informer
+}
+
+// NewDynamicInformer creates a new dynamic informer
+// for given namespace, fieldSelector and labelSelector.
+func NewDynamicInformer(
+	c dynamic.Interface,
+	gvr schema.GroupVersionResource,
+	selector *util.ObjectSelector,
+	handleObj func(interface{}, interface{}),
+) cache.SharedInformer {
+	optionsModifier := func(options *metav1.ListOptions) {
+		options.FieldSelector = selector.FieldSelector
+		options.LabelSelector = selector.LabelSelector
+	}
+	tweakListOptions := dynamicinformer.TweakListOptionsFunc(optionsModifier)
+	dInformerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(c, 0, selector.Namespace, tweakListOptions)
+
+	informer := dInformerFactory.ForResource(gvr).Informer()
+	if err := informer.SetTransform(TrimManagedFields); err != nil {
+		klog.Errorf("cannot set transform: %v", err)
+	}
+	addEventHandler(informer, handleObj)
+	return informer
+}
+
+func addEventHandler(i cache.SharedInformer,
+	handleObj func(interface{}, interface{}),
+) {
+	_, err := i.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			handleObj(nil, obj)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			handleObj(oldObj, newObj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				handleObj(tombstone.Obj, nil)
+			} else {
+				handleObj(obj, nil)
+			}
+		},
+	})
+	if err != nil {
+		klog.Errorf("cannot add event handler: %v", err)
+	}
+}
+
+// StartAndSync starts informer and waits for it to be synced.
+func StartAndSync(i cache.SharedInformer, stopCh <-chan struct{}, timeout time.Duration) error {
+	go i.Run(stopCh)
+	timeoutCh := make(chan struct{})
+	timeoutTimer := time.AfterFunc(timeout, func() {
+		close(timeoutCh)
+	})
+	defer timeoutTimer.Stop()
+	if !cache.WaitForCacheSync(timeoutCh, i.HasSynced) {
+		return fmt.Errorf("timed out waiting for caches to sync")
+	}
+	return nil
+}
+
+
+// CreateFilteredEventHandler creates an event handler that filters events locally based on ObjectSelector.
+func CreateFilteredEventHandler(selector *util.ObjectSelector, handleObj func(interface{}, interface{})) cache.ResourceEventHandler {
+	fieldSel, err := fields.ParseSelector(selector.FieldSelector)
+	if err != nil {
+		klog.Errorf("Failed to parse field selector: %v", err)
+	}
+	labelSel, err := labels.Parse(selector.LabelSelector)
+	if err != nil {
+		klog.Errorf("Failed to parse label selector: %v", err)
+	}
+
+	testObj := func(obj interface{}) bool {
+		metaObj, err := meta.Accessor(obj)
+		if err != nil {
+			return false
+		}
+		if selector.Namespace != metav1.NamespaceAll && metaObj.GetNamespace() != selector.Namespace {
+			return false
+		}
+		if labelSel != nil && !labelSel.Empty() {
+			if !labelSel.Matches(labels.Set(metaObj.GetLabels())) {
+				return false
+			}
+		}
+		if fieldSel != nil && !fieldSel.Empty() {
+			// Using basic field matching for standard fields. Often Name is sufficient for subset filtering in CL2.
+			if name, found := fieldSel.RequiresExactMatch("metadata.name"); found && metaObj.GetName() != name {
+				return false
+			}
+		}
+		return true
+	}
+
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if testObj(obj) {
+				handleObj(nil, obj)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if testObj(newObj) || testObj(oldObj) {
+				handleObj(oldObj, newObj)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				if testObj(tombstone.Obj) {
+					handleObj(tombstone.Obj, nil)
+				}
+			} else {
+				if testObj(obj) {
+					handleObj(obj, nil)
+				}
+			}
+		},
+	}
+}

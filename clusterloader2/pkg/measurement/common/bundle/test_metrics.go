@@ -19,7 +19,8 @@ package bundle
 import (
 	"fmt"
 
-	"github.com/golang/glog"
+	goerrors "github.com/go-errors/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/perf-tests/clusterloader2/pkg/errors"
 	"k8s.io/perf-tests/clusterloader2/pkg/measurement"
 	"k8s.io/perf-tests/clusterloader2/pkg/util"
@@ -30,49 +31,107 @@ const (
 )
 
 func init() {
-	measurement.Register(testMetricsMeasurementName, createTestMetricsMeasurment)
+	if err := measurement.Register(testMetricsMeasurementName, createTestMetricsMeasurement); err != nil {
+		klog.Fatalf("Cannot register %s: %v", testMetricsMeasurementName, err)
+	}
 }
 
-func createTestMetricsMeasurment() measurement.Measurement {
+func createTestMetricsMeasurement() measurement.Measurement {
 	var metrics testMetrics
 	var err error
 	if metrics.etcdMetrics, err = measurement.CreateMeasurement("EtcdMetrics"); err != nil {
-		glog.Errorf("%s: etcdMetrics creation error: %v", metrics, err)
+		klog.Errorf("%v: etcdMetrics creation error: %v", metrics, err)
 	}
 	if metrics.schedulingMetrics, err = measurement.CreateMeasurement("SchedulingMetrics"); err != nil {
-		glog.Errorf("%s: schedulingMetrics creation error: %v", metrics, err)
+		klog.Errorf("%v: schedulingMetrics creation error: %v", metrics, err)
 	}
 	if metrics.metricsForE2E, err = measurement.CreateMeasurement("MetricsForE2E"); err != nil {
-		glog.Errorf("%s: metricsForE2E creation error: %v", metrics, err)
+		klog.Errorf("%v: metricsForE2E creation error: %v", metrics, err)
 	}
 	if metrics.resourceUsageSummary, err = measurement.CreateMeasurement("ResourceUsageSummary"); err != nil {
-		glog.Errorf("%s: resourceUsageSummary creation error: %v", metrics, err)
+		klog.Errorf("%v: resourceUsageSummary creation error: %v", metrics, err)
+	}
+	if metrics.etcdCPUProfile, err = measurement.CreateMeasurement("CPUProfile"); err != nil {
+		klog.Errorf("%v: etcdCPUProfile creation error: %v", metrics, err)
+	}
+	if metrics.etcdMemoryProfile, err = measurement.CreateMeasurement("MemoryProfile"); err != nil {
+		klog.Errorf("%v: etcdMemoryProfile creation error: %v", metrics, err)
+	}
+	if metrics.etcdBlockProfile, err = measurement.CreateMeasurement("BlockProfile"); err != nil {
+		klog.Errorf("%v: etcdBlockProfile creation error: %v", metrics, err)
+	}
+	if metrics.etcdEventsCPUProfile, err = measurement.CreateMeasurement("CPUProfile"); err != nil {
+		klog.Errorf("%v: etcdEventsCPUProfile creation error: %v", metrics, err)
+	}
+	if metrics.etcdEventsMemoryProfile, err = measurement.CreateMeasurement("MemoryProfile"); err != nil {
+		klog.Errorf("%v: etcdEventsMemoryProfile creation error: %v", metrics, err)
+	}
+	if metrics.etcdEventsBlockProfile, err = measurement.CreateMeasurement("BlockProfile"); err != nil {
+		klog.Errorf("%v: etcdEventsBlockProfile creation error: %v", metrics, err)
 	}
 	if metrics.apiserverCPUProfile, err = measurement.CreateMeasurement("CPUProfile"); err != nil {
-		glog.Errorf("%s: apiserverCPUProfile creation error: %v", metrics, err)
+		klog.Errorf("%v: apiserverCPUProfile creation error: %v", metrics, err)
 	}
 	if metrics.apiserverMemoryProfile, err = measurement.CreateMeasurement("MemoryProfile"); err != nil {
-		glog.Errorf("%s: apiserverMemoryProfile creation error: %v", metrics, err)
+		klog.Errorf("%v: apiserverMemoryProfile creation error: %v", metrics, err)
+	}
+	if metrics.apiserverBlockProfile, err = measurement.CreateMeasurement("BlockProfile"); err != nil {
+		klog.Errorf("%v: apiserverBlockProfile creation error: %v", metrics, err)
+	}
+	if metrics.schedulerCPUProfile, err = measurement.CreateMeasurement("CPUProfile"); err != nil {
+		klog.Errorf("%v: schedulerCPUProfile creation error: %v", metrics, err)
 	}
 	if metrics.schedulerMemoryProfile, err = measurement.CreateMeasurement("MemoryProfile"); err != nil {
-		glog.Errorf("%s: schedulerMemoryProfile creation error: %v", metrics, err)
+		klog.Errorf("%v: schedulerMemoryProfile creation error: %v", metrics, err)
+	}
+	if metrics.schedulerBlockProfile, err = measurement.CreateMeasurement("BlockProfile"); err != nil {
+		klog.Errorf("%v: schedulerBlockProfile creation error: %v", metrics, err)
+	}
+	if metrics.controllerManagerCPUProfile, err = measurement.CreateMeasurement("CPUProfile"); err != nil {
+		klog.Errorf("%v: controllerManagerCPUProfile creation error: %v", metrics, err)
+	}
+	if metrics.controllerManagerMemoryProfile, err = measurement.CreateMeasurement("MemoryProfile"); err != nil {
+		klog.Errorf("%v: controllerManagerMemoryProfile creation error: %v", metrics, err)
+	}
+	if metrics.controllerManagerBlockProfile, err = measurement.CreateMeasurement("BlockProfile"); err != nil {
+		klog.Errorf("%v: controllerManagerBlockProfile creation error: %v", metrics, err)
+	}
+	if metrics.systemPodMetrics, err = measurement.CreateMeasurement("SystemPodMetrics"); err != nil {
+		klog.Errorf("%v: systemPodMetrics creation error: %v", metrics, err)
+	}
+	if metrics.clusterOOMsTracker, err = measurement.CreateMeasurement("ClusterOOMsTracker"); err != nil {
+		klog.Errorf("%v: clusterOOMsTracker creation error: %v", metrics, err)
 	}
 	return &metrics
 }
 
 type testMetrics struct {
-	etcdMetrics            measurement.Measurement
-	schedulingMetrics      measurement.Measurement
-	metricsForE2E          measurement.Measurement
-	resourceUsageSummary   measurement.Measurement
-	apiserverCPUProfile    measurement.Measurement
-	apiserverMemoryProfile measurement.Measurement
-	schedulerMemoryProfile measurement.Measurement
+	etcdMetrics                    measurement.Measurement
+	schedulingMetrics              measurement.Measurement
+	metricsForE2E                  measurement.Measurement
+	resourceUsageSummary           measurement.Measurement
+	etcdCPUProfile                 measurement.Measurement
+	etcdMemoryProfile              measurement.Measurement
+	etcdBlockProfile               measurement.Measurement
+	etcdEventsCPUProfile           measurement.Measurement
+	etcdEventsMemoryProfile        measurement.Measurement
+	etcdEventsBlockProfile         measurement.Measurement
+	apiserverCPUProfile            measurement.Measurement
+	apiserverMemoryProfile         measurement.Measurement
+	apiserverBlockProfile          measurement.Measurement
+	schedulerCPUProfile            measurement.Measurement
+	schedulerMemoryProfile         measurement.Measurement
+	schedulerBlockProfile          measurement.Measurement
+	controllerManagerCPUProfile    measurement.Measurement
+	controllerManagerMemoryProfile measurement.Measurement
+	controllerManagerBlockProfile  measurement.Measurement
+	systemPodMetrics               measurement.Measurement
+	clusterOOMsTracker             measurement.Measurement
 }
 
 // Execute supports two actions. start - which sets up all metrics.
 // stop - which stops all metrics and collects all measurements.
-func (t *testMetrics) Execute(config *measurement.MeasurementConfig) ([]measurement.Summary, error) {
+func (t *testMetrics) Execute(config *measurement.Config) ([]measurement.Summary, error) {
 	var summaries []measurement.Summary
 	errList := errors.NewErrorList()
 	action, err := util.GetString(config.Params, "action")
@@ -89,42 +148,146 @@ func (t *testMetrics) Execute(config *measurement.MeasurementConfig) ([]measurem
 	actionGatherConfig := createConfig(config, map[string]interface{}{
 		"action": "gather",
 	})
-	kubeApiserverConfig := createConfig(config, map[string]interface{}{
+	etcdStartConfig := createConfig(config, map[string]interface{}{
+		"action":        "start",
+		"componentName": "etcd",
+	})
+	etcdGatherConfig := createConfig(config, map[string]interface{}{
+		"action":        "gather",
+		"componentName": "etcd",
+	})
+	etcdEventsStartConfig := createConfig(config, map[string]interface{}{
+		"action":        "start",
+		"componentName": "etcd-events",
+	})
+	etcdEventsGatherConfig := createConfig(config, map[string]interface{}{
+		"action":        "gather",
+		"componentName": "etcd-events",
+	})
+	kubeApiserverStartConfig := createConfig(config, map[string]interface{}{
+		"action":        "start",
 		"componentName": "kube-apiserver",
 	})
-	kubeSchedulerConfig := createConfig(config, map[string]interface{}{
+	kubeApiserverGatherConfig := createConfig(config, map[string]interface{}{
+		"action":        "gather",
+		"componentName": "kube-apiserver",
+	})
+	kubeSchedulerStartConfig := createConfig(config, map[string]interface{}{
+		"action":        "start",
 		"componentName": "kube-scheduler",
+	})
+	kubeSchedulerGatherConfig := createConfig(config, map[string]interface{}{
+		"action":        "gather",
+		"componentName": "kube-scheduler",
+	})
+	kubeControllerManagerStartConfig := createConfig(config, map[string]interface{}{
+		"action":        "start",
+		"componentName": "kube-controller-manager",
+	})
+	kubeControllerManagerGatherConfig := createConfig(config, map[string]interface{}{
+		"action":        "gather",
+		"componentName": "kube-controller-manager",
 	})
 
 	switch action {
 	case "start":
 		summary, err := execute(t.etcdMetrics, actionStartConfig)
-		appendResults(&summaries, errList, summary, err)
+		appendResults(&summaries, errList, summary, executeError(t.etcdMetrics.String(), action, err))
 		summary, err = execute(t.schedulingMetrics, actionResetConfig)
-		appendResults(&summaries, errList, summary, err)
+		appendResults(&summaries, errList, summary, executeError(t.schedulingMetrics.String(), action, err))
 		summary, err = execute(t.resourceUsageSummary, actionStartConfig)
-		appendResults(&summaries, errList, summary, err)
+		appendResults(&summaries, errList, summary, executeError(t.resourceUsageSummary.String(), action, err))
+		summary, err = execute(t.etcdCPUProfile, etcdStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdCPUProfile.String(), action, err))
+		summary, err = execute(t.etcdMemoryProfile, etcdStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdMemoryProfile.String(), action, err))
+		summary, err = execute(t.etcdBlockProfile, etcdStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdBlockProfile.String(), action, err))
+		summary, err = execute(t.etcdEventsCPUProfile, etcdEventsStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdEventsCPUProfile.String(), action, err))
+		summary, err = execute(t.etcdEventsMemoryProfile, etcdEventsStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdEventsMemoryProfile.String(), action, err))
+		summary, err = execute(t.etcdEventsBlockProfile, etcdEventsStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdEventsBlockProfile.String(), action, err))
+		summary, err = execute(t.apiserverCPUProfile, kubeApiserverStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.apiserverCPUProfile.String(), action, err))
+		summary, err = execute(t.apiserverMemoryProfile, kubeApiserverStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.apiserverMemoryProfile.String(), action, err))
+		summary, err = execute(t.apiserverBlockProfile, kubeApiserverStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.apiserverBlockProfile.String(), action, err))
+		summary, err = execute(t.schedulerCPUProfile, kubeSchedulerStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.schedulerCPUProfile.String(), action, err))
+		summary, err = execute(t.schedulerMemoryProfile, kubeSchedulerStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.schedulerMemoryProfile.String(), action, err))
+		summary, err = execute(t.schedulerBlockProfile, kubeSchedulerStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.schedulerBlockProfile.String(), action, err))
+		summary, err = execute(t.controllerManagerCPUProfile, kubeControllerManagerStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.controllerManagerCPUProfile.String(), action, err))
+		summary, err = execute(t.controllerManagerMemoryProfile, kubeControllerManagerStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.controllerManagerMemoryProfile.String(), action, err))
+		summary, err = execute(t.controllerManagerBlockProfile, kubeControllerManagerStartConfig)
+		appendResults(&summaries, errList, summary, executeError(t.controllerManagerBlockProfile.String(), action, err))
+		summary, err = execute(t.systemPodMetrics, config)
+		appendResults(&summaries, errList, summary, executeError(t.systemPodMetrics.String(), action, err))
+		summary, err = execute(t.clusterOOMsTracker, config)
+		appendResults(&summaries, errList, summary, executeError(t.clusterOOMsTracker.String(), action, err))
+	case "pauseSystemPodMetrics":
+		forwarded := createConfig(config, map[string]interface{}{"action": "pause"})
+		summary, err := execute(t.systemPodMetrics, forwarded)
+		appendResults(&summaries, errList, summary, executeError(t.systemPodMetrics.String(), action, err))
+	case "unpauseSystemPodMetrics":
+		forwarded := createConfig(config, map[string]interface{}{"action": "unpause"})
+		summary, err := execute(t.systemPodMetrics, forwarded)
+		appendResults(&summaries, errList, summary, executeError(t.systemPodMetrics.String(), action, err))
 	case "gather":
 		summary, err := execute(t.etcdMetrics, actionGatherConfig)
-		appendResults(&summaries, errList, summary, err)
+		appendResults(&summaries, errList, summary, executeError(t.etcdMetrics.String(), action, err))
 		summary, err = execute(t.schedulingMetrics, actionGatherConfig)
-		appendResults(&summaries, errList, summary, err)
+		appendResults(&summaries, errList, summary, executeError(t.schedulingMetrics.String(), action, err))
 		summary, err = execute(t.metricsForE2E, config)
-		appendResults(&summaries, errList, summary, err)
+		appendResults(&summaries, errList, summary, executeError(t.metricsForE2E.String(), action, err))
 		summary, err = execute(t.resourceUsageSummary, actionGatherConfig)
-		appendResults(&summaries, errList, summary, err)
-		summary, err = execute(t.apiserverCPUProfile, kubeApiserverConfig)
-		appendResults(&summaries, errList, summary, err)
-		summary, err = execute(t.apiserverMemoryProfile, kubeApiserverConfig)
-		appendResults(&summaries, errList, summary, err)
-		summary, err = execute(t.schedulerMemoryProfile, kubeSchedulerConfig)
-		appendResults(&summaries, errList, summary, err)
+		appendResults(&summaries, errList, summary, executeError(t.resourceUsageSummary.String(), action, err))
+		summary, err = execute(t.etcdCPUProfile, etcdGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdCPUProfile.String(), action, err))
+		summary, err = execute(t.etcdMemoryProfile, etcdGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdMemoryProfile.String(), action, err))
+		summary, err = execute(t.etcdBlockProfile, etcdGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdBlockProfile.String(), action, err))
+		summary, err = execute(t.etcdEventsCPUProfile, etcdEventsGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdEventsCPUProfile.String(), action, err))
+		summary, err = execute(t.etcdEventsMemoryProfile, etcdEventsGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdEventsMemoryProfile.String(), action, err))
+		summary, err = execute(t.etcdEventsBlockProfile, etcdEventsGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.etcdEventsBlockProfile.String(), action, err))
+		summary, err = execute(t.apiserverCPUProfile, kubeApiserverGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.apiserverCPUProfile.String(), action, err))
+		summary, err = execute(t.apiserverMemoryProfile, kubeApiserverGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.apiserverMemoryProfile.String(), action, err))
+		summary, err = execute(t.apiserverBlockProfile, kubeApiserverGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.apiserverBlockProfile.String(), action, err))
+		summary, err = execute(t.schedulerCPUProfile, kubeSchedulerGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.schedulerCPUProfile.String(), action, err))
+		summary, err = execute(t.schedulerMemoryProfile, kubeSchedulerGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.schedulerMemoryProfile.String(), action, err))
+		summary, err = execute(t.schedulerBlockProfile, kubeSchedulerGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.schedulerBlockProfile.String(), action, err))
+		summary, err = execute(t.controllerManagerCPUProfile, kubeControllerManagerGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.controllerManagerCPUProfile.String(), action, err))
+		summary, err = execute(t.controllerManagerMemoryProfile, kubeControllerManagerGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.controllerManagerMemoryProfile.String(), action, err))
+		summary, err = execute(t.controllerManagerBlockProfile, kubeControllerManagerGatherConfig)
+		appendResults(&summaries, errList, summary, executeError(t.controllerManagerBlockProfile.String(), action, err))
+		summary, err = execute(t.systemPodMetrics, config)
+		appendResults(&summaries, errList, summary, executeError(t.systemPodMetrics.String(), action, err))
+		summary, err = execute(t.clusterOOMsTracker, config)
+		appendResults(&summaries, errList, summary, executeError(t.clusterOOMsTracker.String(), action, err))
 	default:
 		return summaries, fmt.Errorf("unknown action %v", action)
 	}
 
 	if !errList.IsEmpty() {
-		glog.Errorf("%s: %v", t, errList.String())
+		klog.Errorf("%s: %v", t, errList.String())
 		return summaries, errList
 	}
 	return summaries, nil
@@ -136,9 +299,21 @@ func (t *testMetrics) Dispose() {
 	t.schedulingMetrics.Dispose()
 	t.metricsForE2E.Dispose()
 	t.resourceUsageSummary.Dispose()
+	t.etcdCPUProfile.Dispose()
+	t.etcdMemoryProfile.Dispose()
+	t.etcdBlockProfile.Dispose()
+	t.etcdEventsCPUProfile.Dispose()
+	t.etcdEventsMemoryProfile.Dispose()
+	t.etcdEventsBlockProfile.Dispose()
 	t.apiserverCPUProfile.Dispose()
 	t.apiserverMemoryProfile.Dispose()
+	t.apiserverBlockProfile.Dispose()
+	t.schedulerCPUProfile.Dispose()
 	t.schedulerMemoryProfile.Dispose()
+	t.schedulerBlockProfile.Dispose()
+	t.controllerManagerCPUProfile.Dispose()
+	t.controllerManagerMemoryProfile.Dispose()
+	t.controllerManagerBlockProfile.Dispose()
 }
 
 // String returns a string representation of the measurement.
@@ -146,7 +321,7 @@ func (*testMetrics) String() string {
 	return testMetricsMeasurementName
 }
 
-func createConfig(config *measurement.MeasurementConfig, overrides map[string]interface{}) *measurement.MeasurementConfig {
+func createConfig(config *measurement.Config, overrides map[string]interface{}) *measurement.Config {
 	params := make(map[string]interface{})
 	for k, v := range config.Params {
 		params[k] = v
@@ -154,15 +329,16 @@ func createConfig(config *measurement.MeasurementConfig, overrides map[string]in
 	for k, v := range overrides {
 		params[k] = v
 	}
-	return &measurement.MeasurementConfig{
-		ClientSet:        config.ClientSet,
-		ClusterConfig:    config.ClusterConfig,
-		Params:           params,
-		TemplateProvider: config.TemplateProvider,
+	return &measurement.Config{
+		ClusterFramework:    config.ClusterFramework,
+		PrometheusFramework: config.PrometheusFramework,
+		Params:              params,
+		TemplateProvider:    config.TemplateProvider,
+		CloudProvider:       config.CloudProvider,
 	}
 }
 
-func execute(m measurement.Measurement, config *measurement.MeasurementConfig) ([]measurement.Summary, error) {
+func execute(m measurement.Measurement, config *measurement.Config) ([]measurement.Summary, error) {
 	if m == nil {
 		return nil, fmt.Errorf("uninitialized metric")
 	}
@@ -174,4 +350,11 @@ func appendResults(summaries *[]measurement.Summary, errList *errors.ErrorList, 
 		errList.Append(errResult)
 	}
 	*summaries = append(*summaries, summaryResults...)
+}
+
+func executeError(measurement, action string, err error) error {
+	if err != nil {
+		return goerrors.Errorf("action %s failed for %s measurement: %v", action, measurement, err)
+	}
+	return nil
 }

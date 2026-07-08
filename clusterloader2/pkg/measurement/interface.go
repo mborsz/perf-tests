@@ -17,29 +17,48 @@ limitations under the License.
 package measurement
 
 import (
-	clientset "k8s.io/client-go/kubernetes"
+	"time"
+
 	"k8s.io/perf-tests/clusterloader2/pkg/config"
+	"k8s.io/perf-tests/clusterloader2/pkg/framework"
+	"k8s.io/perf-tests/clusterloader2/pkg/provider"
+
+	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 )
 
-// MeasurementConfig provides client and parameters required for the measurement execution.
-type MeasurementConfig struct {
-	// Clientset is a kubernetes client.
-	ClientSet clientset.Interface
-	// ClusterConfig represents configuration of the cluster.
-	ClusterConfig *config.ClusterConfig
+// Config provides client and parameters required for the measurement execution.
+type Config struct {
+	// ClusterFramework returns cluster framework.
+	ClusterFramework *framework.Framework
+	// PrometheusFramework returns prometheus framework.
+	PrometheusFramework *framework.Framework
 	// Params is a map of {name: value} pairs enabling for injection of arbitrary config
 	// into the Execute method.
 	Params map[string]interface{}
 	// TemplateProvider provides templated objects.
-	TemplateProvider *config.TemplateProvider
-	// TODO(krzysied): add CloudProvider.
+	TemplateProvider    *config.TemplateProvider
+	ClusterLoaderConfig *config.ClusterLoaderConfig
+
+	// Identifier identifies this instance of measurement.
+	Identifier    string
+	CloudProvider provider.Provider
+
+	// ClusterVersion contains the version of the cluster and is used to select
+	// available metrics.
+	ClusterVersion version.Info
+
+	InformerFactory        informers.SharedInformerFactory
+	DynamicInformerFactory dynamicinformer.DynamicSharedInformerFactory
+	InformerStopCh         chan struct{}
 }
 
 // Measurement is an common interface for all measurements methods. It should be implemented by the user to
 // allow his/her measurement method to be registered in the measurement factory.
-// See https://github.com/kubernetes/perf-tests/blob/master/clusterloader/docs/design.md for reference.
+// See https://github.com/kubernetes/perf-tests/blob/master/clusterloader2/docs/design.md for reference.
 type Measurement interface {
-	Execute(config *MeasurementConfig) ([]Summary, error)
+	Execute(config *Config) ([]Summary, error)
 	Dispose()
 	String() string
 }
@@ -49,5 +68,7 @@ type createMeasurementFunc func() Measurement
 // Summary represenst result of specific measurement.
 type Summary interface {
 	SummaryName() string
-	PrintSummary() (string, error)
+	SummaryExt() string
+	SummaryTime() time.Time
+	SummaryContent() string
 }
