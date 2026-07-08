@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	controllerUIDIndex = "controllerUID"
+	ControllerUIDIndex = "controllerUID"
 )
 
 // ControlledPodsIndexer is able to efficiently find pods with ownerReference pointing a given controller object.
@@ -78,12 +78,8 @@ func (p *ControlledPodsIndexer) GetIndexer() cache.Indexer {
 
 // NewControlledPodsIndexer creates a new ControlledPodsIndexer instance.
 func NewControlledPodsIndexer(podsInformer coreinformers.PodInformer, rsInformer appsinformers.ReplicaSetInformer) (*ControlledPodsIndexer, error) {
-	if err := podsInformer.Informer().AddIndexers(cache.Indexers{controllerUIDIndex: controllerUIDIndexFunc}); err != nil {
-		return nil, fmt.Errorf("failed to register indexer: %w", err)
-	}
-
 	// We need a separate storage from rsInformer as we postpone deletion until all pods are removed.
-	rsIndexer := cache.NewIndexer(deletionHandlingUIDKeyFunc, cache.Indexers{controllerUIDIndex: controllerUIDIndexFunc})
+	rsIndexer := cache.NewIndexer(deletionHandlingUIDKeyFunc, cache.Indexers{ControllerUIDIndex: ControllerUIDIndexFunc})
 
 	cpi := &ControlledPodsIndexer{
 		podsIndexer:       podsInformer.Informer().GetIndexer(),
@@ -196,7 +192,7 @@ func (p *ControlledPodsIndexer) clearRSDataIfPossibleLocked(rsUID types.UID) err
 	return p.rsIndexer.Delete(obj)
 }
 
-func controllerUIDIndexFunc(obj interface{}) ([]string, error) {
+func ControllerUIDIndexFunc(obj interface{}) ([]string, error) {
 	meta, err := meta.Accessor(obj)
 	if err != nil {
 		return nil, fmt.Errorf("object has no meta: %v", err)
@@ -227,7 +223,7 @@ func (p *ControlledPodsIndexer) PodsControlledBy(obj interface{}) ([]*corev1.Pod
 	var podOwners []types.UID
 	switch typeAccessor.GetKind() {
 	case "Deployment":
-		replicaSets, err := p.rsIndexer.ByIndex(controllerUIDIndex, string(metaAccessor.GetUID()))
+		replicaSets, err := p.rsIndexer.ByIndex(ControllerUIDIndex, string(metaAccessor.GetUID()))
 		if err != nil {
 			return nil, fmt.Errorf("failed to get replicasets controlled by %v: %w", metaAccessor.GetUID(), err)
 		}
@@ -254,7 +250,7 @@ func (p *ControlledPodsIndexer) PodsControlledBy(obj interface{}) ([]*corev1.Pod
 }
 
 func (p *ControlledPodsIndexer) appendPodsControlledBy(res []*corev1.Pod, uid types.UID) ([]*corev1.Pod, error) {
-	objs, err := p.podsIndexer.ByIndex(controllerUIDIndex, string(uid))
+	objs, err := p.podsIndexer.ByIndex(ControllerUIDIndex, string(uid))
 	if err != nil {
 		return nil, fmt.Errorf("method ByIndex failed: %w", err)
 	}

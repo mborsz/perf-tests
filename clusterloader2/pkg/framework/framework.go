@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -33,7 +34,12 @@ import (
 	frconfig "k8s.io/perf-tests/clusterloader2/pkg/framework/config"
 
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	measurementutil "k8s.io/perf-tests/clusterloader2/pkg/measurement/util"
+	"k8s.io/perf-tests/clusterloader2/pkg/measurement/util/informer"
 
 	// ensure auth plugins are loaded
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -53,6 +59,9 @@ type Framework struct {
 	clusterConfig         *config.ClusterConfig
 	restClientConfig      *restclient.Config
 	discoveryClient       *discovery.DiscoveryClient
+
+	sharedInformerFactory        informers.SharedInformerFactory
+	dynamicSharedInformerFactory dynamicinformer.DynamicSharedInformerFactory
 }
 
 // NewFramework creates new framework based on given clusterConfig.
@@ -92,16 +101,32 @@ func newFramework(clusterConfig *config.ClusterConfig, clientsNumber int, kubeCo
 		return nil, fmt.Errorf("discovery client creation error: %v", err)
 	}
 
+	f.sharedInformerFactory = informers.NewSharedInformerFactoryWithOptions(f.clientSets.GetClient(), 0, informers.WithTransform(informer.TrimManagedFields))
+	f.dynamicSharedInformerFactory = dynamicinformer.NewFilteredDynamicSharedInformerFactory(f.dynamicClients.GetClient(), 0, metav1.NamespaceAll, nil)
+
+	// Register central indexers
+	if err := f.sharedInformerFactory.Core().V1().Pods().Informer().AddIndexers(cache.Indexers{measurementutil.ControllerUIDIndex: measurementutil.ControllerUIDIndexFunc}); err != nil {
+		return nil, fmt.Errorf("failed to register controllerUID indexer: %w", err)
+	}
+
 	return &f, nil
 }
 
 // NewFrameworkFromClients creates new Framework with given clientSets and dynamicClients for testing.
 func NewFrameworkFromClients(clientSets *MultiClientSet, dynamicClients *MultiDynamicClient) *Framework {
-	return &Framework{
+	f := &Framework{
 		automanagedNamespaces: map[string]bool{},
 		clientSets:            clientSets,
 		dynamicClients:        dynamicClients,
 	}
+	f.sharedInformerFactory = informers.NewSharedInformerFactoryWithOptions(clientSets.GetClient(), 0, informers.WithTransform(informer.TrimManagedFields))
+	f.dynamicSharedInformerFactory = dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClients.GetClient(), 0, metav1.NamespaceAll, nil)
+
+	if err := f.sharedInformerFactory.Core().V1().Pods().Informer().AddIndexers(cache.Indexers{measurementutil.ControllerUIDIndex: measurementutil.ControllerUIDIndexFunc}); err != nil {
+		// Using panic here as it's a test helper and failure to register indexer is fatal for tests using it.
+		panic(fmt.Sprintf("failed to register controllerUID indexer: %v", err))
+	}
+	return f
 }
 
 // GetAutomanagedNamespacePrefix returns automanaged namespace prefix.
@@ -135,6 +160,14 @@ func (f *Framework) GetClusterConfig() *config.ClusterConfig {
 
 func (f *Framework) GetDiscoveryClient() *discovery.DiscoveryClient {
 	return f.discoveryClient
+}
+
+func (f *Framework) GetSharedInformerFactory() informers.SharedInformerFactory {
+	return f.sharedInformerFactory
+}
+
+func (f *Framework) GetDynamicSharedInformerFactory() dynamicinformer.DynamicSharedInformerFactory {
+	return f.dynamicSharedInformerFactory
 }
 
 // CreateAutomanagedNamespaces creates automanged namespaces.

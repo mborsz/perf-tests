@@ -111,8 +111,7 @@ func (w *waitForGenericK8sObjectsMeasurement) Execute(config *measurement.Config
 	// Special fast path for performance-critical resource type: pods.
 	if groupVersionResource.Resource == "pods" && groupVersionResource.Group == "" && groupVersionResource.Version == "v1" {
 		klog.V(2).Infof("%s: Using optimized typed pod informer", waitForGenericK8sObjectsMeasurementName)
-		typedClient := config.ClusterFramework.GetClientSets().GetClient()
-		podsIndexer, err := podIndexerFactory.PodsIndexer(typedClient)
+		podsIndexer, err := podIndexerFactory.PodsIndexer(config.ClusterFramework)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve shared pods indexer: %w", err)
 		}

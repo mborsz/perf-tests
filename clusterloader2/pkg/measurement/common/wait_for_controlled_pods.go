@@ -31,8 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/informers"
-	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -77,16 +75,16 @@ type sharedPodIndexerFactory struct {
 	once        sync.Once
 }
 
-func (s *sharedPodIndexerFactory) PodsIndexer(c clientset.Interface) (*measurementutil.ControlledPodsIndexer, error) {
+func (s *sharedPodIndexerFactory) PodsIndexer(f *framework.Framework) (*measurementutil.ControlledPodsIndexer, error) {
 	s.once.Do(func() {
-		s.podsIndexer, s.err = s.start(c)
+		s.podsIndexer, s.err = s.start(f)
 	})
 	return s.podsIndexer, s.err
 }
 
-func (s *sharedPodIndexerFactory) start(c clientset.Interface) (*measurementutil.ControlledPodsIndexer, error) {
+func (s *sharedPodIndexerFactory) start(f *framework.Framework) (*measurementutil.ControlledPodsIndexer, error) {
 	ctx := context.Background()
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(c, 0, informers.WithTransform(informer.TrimManagedFields))
+	informerFactory := f.GetSharedInformerFactory()
 	podsIndexer, err := measurementutil.NewControlledPodsIndexer(
 		informerFactory.Core().V1().Pods(),
 		informerFactory.Apps().V1().ReplicaSets(),
@@ -264,7 +262,7 @@ func (w *waitForControlledPodsRunningMeasurement) start() error {
 
 	w.isRunning = true
 	w.stopCh = make(chan struct{})
-	podsIndexer, err := podIndexerFactory.PodsIndexer(w.clusterFramework.GetClientSets().GetClient())
+	podsIndexer, err := podIndexerFactory.PodsIndexer(w.clusterFramework)
 	if err != nil {
 		return err
 	}

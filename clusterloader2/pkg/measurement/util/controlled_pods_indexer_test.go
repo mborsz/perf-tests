@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 )
 
 const (
@@ -148,6 +149,10 @@ func newMockedControlledPodsIndexer(ctx context.Context, t *testing.T, client *f
 	if err != nil {
 		t.Fatalf("failed to create ControlledPodsIndexer instance: %v", err)
 	}
+	if err := podsInformer.Informer().AddIndexers(cache.Indexers{ControllerUIDIndex: ControllerUIDIndexFunc}); err != nil {
+		t.Fatalf("failed to register indexer: %v", err)
+	}
+
 	informerFactory.Start(ctx.Done())
 	if !p.WaitForCacheSync(ctx) {
 		t.Fatalf("failed to sync informer")
